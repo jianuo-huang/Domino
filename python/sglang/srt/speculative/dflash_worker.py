@@ -668,10 +668,21 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+
+        if getattr(self.draft_model, "projector_type", None) == "causal_v5":
+            draft_next = self._v5_rollout_draft_block(
+                draft_hidden=draft_hidden,
+                verified_id=block_ids[:, 0],
+                target_model=target_model,
+                lm_head=lm_head,
+            )
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
@@ -872,6 +883,105 @@ class DFlashWorker:
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
         return out_token_ids
+
+    def _v5_rollout_draft_block(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        verified_id: torch.Tensor,
+        target_model,
+        lm_head,
+    ) -> torch.Tensor:
+        """Sequential v5 rollout to produce `block_size - 1` draft tokens.
+
+        Algorithm (mirrors dflash benchmark.py:244-264, adapted to SGLang's
+        shift_label-style block where one slot is reserved for the current
+        token):
+          1. slot_1 = argmax(base_logits[0]).
+          2. Initialize prefix_gru on embeddings of [verified_id, slot_1] to get gru_h.
+          3. For k = 2..block_size-1:
+                 bias = embed_proj(cat(z_k, gru_h))
+                 slot_k = argmax(base_logits[k-1] + bias)
+                 gru_h = prefix_gru_step(embed(slot_k))
+
+        Args:
+            draft_hidden: [B, block_size, hidden_size] draft model output (post-norm).
+            verified_id: [B] current verified token per request (int64).
+            target_model: the SGLang target model (for embed_tokens).
+            lm_head: vocab-parallel lm_head (used to compute dense base logits).
+
+        Returns:
+            [B, block_size - 1] int64 tensor of sampled draft tokens.
+        """
+        bs, total_slots, hidden_size = draft_hidden.shape
+        if total_slots != self.block_size:
+            raise RuntimeError(
+                f"DFLASH v5 expected draft_hidden block dim={self.block_size}, "
+                f"got {total_slots}."
+            )
+        num_draft = self.block_size - 1  # 15 for block_size=16
+        if num_draft <= 0:
+            raise RuntimeError(
+                f"DFLASH v5 requires block_size > 1, got {self.block_size}."
+            )
+
+        device = draft_hidden.device
+        tp_size = int(get_tp_group().world_size)
+        if tp_size != 1:
+            raise NotImplementedError(
+                "DFLASH causal_v5 rollout currently requires TP=1 in SGLang. "
+                f"Got tp_size={tp_size}."
+            )
+
+        weight = lm_head.weight
+        shard = lm_head.shard_indices
+        num_added = int(shard.num_added_elements)
+        if num_added != 0:
+            raise NotImplementedError(
+                "DFLASH causal_v5 rollout does not yet handle added-vocab lm_head shards."
+            )
+        org_vocab_start = int(shard.org_vocab_start_index)
+        num_org = int(shard.num_org_elements)
+        if num_org <= 0:
+            raise RuntimeError("DFLASH lm_head has empty base vocab shard.")
+
+        z = draft_hidden[:, 1:, :].contiguous()  # [B, num_draft, hidden]
+        z_flat = z.reshape(bs * num_draft, hidden_size).to(weight.dtype)
+        base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
+            bs, num_draft, num_org
+        )
+
+        draft_model = self.draft_model
+        embed_module = target_model.get_input_embeddings()
+
+        # Slot 1: pure base argmax (no v5 bias yet).
+        slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
+        slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
+
+        out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+        out[:, 0] = slot_1
+
+        # Initialize GRU from [verified_id, slot_1].
+        prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)  # [B, 2]
+        prefix_embeds = embed_module(prefix_ids).to(z.dtype)
+        gru_h = draft_model.v5_init_gru_hidden(prefix_embeds)  # [B, gru_hidden_dim]
+
+        # Sequential rollout for slots 2..num_draft.
+        for k in range(1, num_draft):
+            z_k = z[:, k, :]  # [B, hidden]
+            bias_k = draft_model.v5_compute_bias(z_k, gru_h)  # [B, vocab]
+            # Slice bias to the shard's base vocab range (TP=1 + no added vocab).
+            shard_end = org_vocab_start + num_org
+            bias_local = bias_k[:, org_vocab_start:shard_end]
+            logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
+            local_arg = torch.argmax(logits_k, dim=-1)
+            tok = (local_arg + org_vocab_start).to(torch.long)
+            out[:, k] = tok
+            if k + 1 < num_draft:
+                new_embed = embed_module(tok).to(z.dtype)
+                gru_h = draft_model.v5_step_gru_hidden(new_embed, gru_h)
+
+        return out
 
     def _append_target_hidden_to_draft_kv(
         self,

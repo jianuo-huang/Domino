@@ -292,6 +292,85 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = draft_config.resolve_block_size(default=16)
 
+        # Optional v5 projector (GRU prefix encoder + MLP that emits a per-step bias on
+        # top of the target lm_head logits). Only created when the checkpoint declares
+        # projector_type=causal_v5; otherwise the draft model is backbone-only.
+        self.projector_type: Optional[str] = draft_config.projector_type
+        self.pure_draft_prefix_len: int = int(draft_config.pure_draft_prefix_len)
+        self.shift_label: bool = bool(draft_config.shift_label)
+        self.gru_hidden_dim: Optional[int] = draft_config.gru_hidden_dim
+        self.emb_dim: Optional[int] = draft_config.emb_dim
+
+        if self.projector_type == "causal_v5":
+            if self.gru_hidden_dim is None or self.emb_dim is None:
+                raise ValueError(
+                    "DFLASH causal_v5 requires gru_hidden_dim and emb_dim. "
+                    f"gru_hidden_dim={self.gru_hidden_dim}, emb_dim={self.emb_dim}."
+                )
+            vocab_size = int(getattr(config, "vocab_size", 0))
+            if vocab_size <= 0:
+                raise ValueError(
+                    f"DFLASH causal_v5 requires positive vocab_size, got {vocab_size}."
+                )
+            self.prefix_gru = nn.GRU(
+                input_size=hidden_size,
+                hidden_size=int(self.gru_hidden_dim),
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(
+                    hidden_size + int(self.gru_hidden_dim),
+                    int(self.emb_dim),
+                    bias=False,
+                ),
+                nn.SiLU(),
+                nn.Linear(int(self.emb_dim), vocab_size, bias=False),
+            )
+
+    def v5_init_gru_hidden(self, prefix_embeds: torch.Tensor) -> torch.Tensor:
+        """Run the v5 prefix GRU over `prefix_embeds` and return the final hidden state.
+
+        Args:
+            prefix_embeds: [B, prefix_token_count, hidden_size] target embeddings of the
+                most recent committed tokens.
+
+        Returns:
+            hidden state [B, gru_hidden_dim].
+        """
+        _, h = self.prefix_gru(prefix_embeds)
+        return h.squeeze(0)
+
+    def v5_step_gru_hidden(
+        self, token_embed: torch.Tensor, gru_h: torch.Tensor
+    ) -> torch.Tensor:
+        """Advance the v5 GRU by one step.
+
+        Args:
+            token_embed: [B, hidden_size] embedding of the just-sampled draft token.
+            gru_h: [B, gru_hidden_dim] previous hidden state.
+
+        Returns:
+            new hidden state [B, gru_hidden_dim].
+        """
+        _, h = self.prefix_gru(token_embed.unsqueeze(1), gru_h.unsqueeze(0).contiguous())
+        return h.squeeze(0)
+
+    def v5_compute_bias(
+        self, z: torch.Tensor, gru_h: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the v5 logit bias for one (or more) draft step(s).
+
+        Args:
+            z: [..., hidden_size] draft hidden state at the step.
+            gru_h: [..., gru_hidden_dim] GRU hidden state at the step.
+
+        Returns:
+            bias logits [..., vocab_size].
+        """
+        return self.embed_proj(torch.cat([z, gru_h], dim=-1))
+
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
         expected = int(self.fc.in_features)
