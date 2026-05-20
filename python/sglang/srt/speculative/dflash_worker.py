@@ -963,7 +963,8 @@ class DFlashWorker:
         out_buf = torch.empty((bs, num_draft), dtype=torch.long, device=device)
 
         if use_fused:
-            block_v = 512
+            block_v = int(os.environ.get("DFLASH_V5_BLOCK_V", "512"))
+            block_m = int(os.environ.get("DFLASH_V5_BLOCK_M", "32"))
             num_v_blocks_shard = (num_org + block_v - 1) // block_v
             # DFLASH_V5_GRU_TABLE_FUSED=1 (default) inlines index_select into the
             # GRU cell kernel; "0" falls back to the original index_select + fused_gru_cell.
@@ -1036,6 +1037,7 @@ class DFlashWorker:
                         out_idx=argmax_idx_buf,
                         final_token=local_tok_buf,
                         block_v=block_v,
+                        block_m=block_m,
                     )
                     tok_full = local_tok_buf + org_vocab_start
                     out_target[:, k] = tok_full
@@ -1280,6 +1282,7 @@ class DFlashWorker:
         if prof_enabled:
             prof = getattr(self, "_v5_prof", None)
             if prof is None:
+                window_size = int(os.environ.get("DFLASH_PROF_V5_WINDOW", "100"))
                 prof = {
                     "n": 0,
                     "base_logits_ms": 0.0,
@@ -1287,6 +1290,11 @@ class DFlashWorker:
                     "loop_ms": 0.0,
                     "total_ms": 0.0,
                     "print_every": 50,
+                    "window_size": window_size,
+                    "win_base_logits": [],
+                    "win_init_gru": [],
+                    "win_loop": [],
+                    "win_total": [],
                     "evt_total_start": torch.cuda.Event(enable_timing=True),
                     "evt_total_end": torch.cuda.Event(enable_timing=True),
                     "evt_base_start": torch.cuda.Event(enable_timing=True),
@@ -1319,6 +1327,10 @@ class DFlashWorker:
                 prof["init_gru_ms"] = 0.0
                 prof["loop_ms"] = 0.0
                 prof["total_ms"] = 0.0
+                prof["win_base_logits"] = []
+                prof["win_init_gru"] = []
+                prof["win_loop"] = []
+                prof["win_total"] = []
                 prof["warmup_reset_done"] = True
                 logger.warning(
                     "[DFLASH v5 prof] reset counters after %.2fs idle gap (warmup boundary)",
@@ -1362,8 +1374,41 @@ class DFlashWorker:
             slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
 
             prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
-            prefix_embeds = embed_module(prefix_ids).to(z.dtype)
-            gru_h = draft_model.v5_init_gru_hidden(prefix_embeds)
+
+            use_fast_init = os.environ.get("DFLASH_V5_FAST_INIT_GRU") == "1"
+            check_init = os.environ.get("DFLASH_V5_FAST_INIT_GRU_CHECK") == "1"
+
+            if use_fast_init or check_init:
+                # Manual 2-step unroll using precomputed gru_input_table.
+                w_hh = state["w_hh"]  # [3*G, G]
+                b_hh = state["b_hh"]  # [3*G] or None
+                w_hh_T = w_hh.T.to(dtype=z.dtype, device=device)
+                h = torch.zeros((bs, G), dtype=z.dtype, device=device)
+                for t_idx in range(prefix_ids.shape[1]):
+                    gi = torch.index_select(gru_input_table, 0, prefix_ids[:, t_idx])
+                    gh = torch.matmul(h, w_hh_T)
+                    if b_hh is not None:
+                        gh.add_(b_hh.to(z.dtype))
+                    r = torch.sigmoid(gi[:, :G] + gh[:, :G])
+                    z_gate = torch.sigmoid(gi[:, G : 2 * G] + gh[:, G : 2 * G])
+                    n = torch.tanh(gi[:, 2 * G :] + r * gh[:, 2 * G :])
+                    h = (1.0 - z_gate) * n + z_gate * h
+                gru_h_fast = h
+
+            if check_init:
+                prefix_embeds = embed_module(prefix_ids).to(z.dtype)
+                gru_h_ref = draft_model.v5_init_gru_hidden(prefix_embeds)
+                diff = (gru_h_ref.float() - gru_h_fast.float()).abs()
+                max_diff = float(diff.max())
+                logger.warning(
+                    "[DFLASH v5 fast_init check] hidden max_abs_diff=%.4e", max_diff
+                )
+                gru_h = gru_h_ref
+            elif use_fast_init:
+                gru_h = gru_h_fast
+            else:
+                prefix_embeds = embed_module(prefix_ids).to(z.dtype)
+                gru_h = draft_model.v5_init_gru_hidden(prefix_embeds)
 
             z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
             if prof_enabled:
@@ -1391,6 +1436,27 @@ class DFlashWorker:
             graph_entry["out_buf"][:, 0].copy_(slot_1)
             graph_entry["graph"].replay()
             out = graph_entry["out_buf"]
+
+            if check_init:
+                out_ref = out.clone()
+                graph_entry["gru_h_buf"].copy_(gru_h_fast)
+                graph_entry["graph"].replay()
+                out_fast = graph_entry["out_buf"].clone()
+                tok_diff = int((out_ref != out_fast).sum().item())
+                if tok_diff > 0:
+                    first_diff = int(
+                        (out_ref[0] != out_fast[0]).nonzero(as_tuple=True)[0][0].item()
+                    )
+                    logger.warning(
+                        "[DFLASH v5 fast_init check] draft tokens DIFFER: %d mismatches, first at k=%d",
+                        tok_diff,
+                        first_diff,
+                    )
+                else:
+                    logger.warning(
+                        "[DFLASH v5 fast_init check] draft tokens match exactly"
+                    )
+                out = out_ref
         else:
             # Full-graph path: base_logits, slot_1, GRU init, z_proj all run
             # inside the captured graph. We only feed z and verified_id.
@@ -1423,21 +1489,44 @@ class DFlashWorker:
             prof["evt_loop_end"].record()
             prof["evt_total_end"].record()
             torch.cuda.synchronize()
-            prof["base_logits_ms"] += prof["evt_base_start"].elapsed_time(prof["evt_base_end"])
-            prof["init_gru_ms"] += prof["evt_init_start"].elapsed_time(prof["evt_init_end"])
-            prof["loop_ms"] += prof["evt_loop_start"].elapsed_time(prof["evt_loop_end"])
-            prof["total_ms"] += prof["evt_total_start"].elapsed_time(prof["evt_total_end"])
+            base_logits_t = prof["evt_base_start"].elapsed_time(prof["evt_base_end"])
+            init_gru_t = prof["evt_init_start"].elapsed_time(prof["evt_init_end"])
+            loop_t = prof["evt_loop_start"].elapsed_time(prof["evt_loop_end"])
+            total_t = prof["evt_total_start"].elapsed_time(prof["evt_total_end"])
+
+            prof["base_logits_ms"] += base_logits_t
+            prof["init_gru_ms"] += init_gru_t
+            prof["loop_ms"] += loop_t
+            prof["total_ms"] += total_t
             prof["n"] += 1
+
+            ws = prof["window_size"]
+            prof["win_base_logits"].append(base_logits_t)
+            prof["win_init_gru"].append(init_gru_t)
+            prof["win_loop"].append(loop_t)
+            prof["win_total"].append(total_t)
+            if len(prof["win_total"]) > ws:
+                prof["win_base_logits"].pop(0)
+                prof["win_init_gru"].pop(0)
+                prof["win_loop"].pop(0)
+                prof["win_total"].pop(0)
+
             if prof["n"] % prof["print_every"] == 0:
                 n = prof["n"]
+                win_n = len(prof["win_total"])
+                win_total = sum(prof["win_total"]) / win_n
+                win_base = sum(prof["win_base_logits"]) / win_n
+                win_init = sum(prof["win_init_gru"]) / win_n
+                win_loop = sum(prof["win_loop"]) / win_n
                 logger.warning(
                     "[DFLASH v5 prof] bs=%d n_calls=%d "
-                    "total=%.3fms base_logits=%.3fms init_gru=%.3fms loop(14step)=%.3fms",
+                    "total=%.3fms (win %.3fms) base_logits=%.3fms (win %.3fms) "
+                    "init_gru=%.3fms (win %.3fms) loop(14step)=%.3fms (win %.3fms)",
                     bs, n,
-                    prof["total_ms"] / n,
-                    prof["base_logits_ms"] / n,
-                    prof["init_gru_ms"] / n,
-                    prof["loop_ms"] / n,
+                    prof["total_ms"] / n, win_total,
+                    prof["base_logits_ms"] / n, win_base,
+                    prof["init_gru_ms"] / n, win_init,
+                    prof["loop_ms"] / n, win_loop,
                 )
 
         return out
