@@ -945,14 +945,22 @@ class DFlashWorker:
         if num_org <= 0:
             raise RuntimeError("DFLASH lm_head has empty base vocab shard.")
 
-        z = draft_hidden[:, 1:, :].contiguous()  # [B, num_draft, hidden]
+        draft_model = self.draft_model
+        embed_module = target_model.get_input_embeddings()
+
+        # shift_label=True: draft_hidden[:, i, :] predicts token at position i+1.
+        # shift_label=False: draft_hidden[:, i, :] predicts token at position i.
+        # For the draft block, position 0 is verified_id; positions 1..block_size-1
+        # are the draft slots.  With shift_label we need draft_hidden[:, 0, :]
+        # to predict slot_1, so we slice [:num_draft]; otherwise we slice [1:].
+        if getattr(draft_model, "shift_label", False):
+            z = draft_hidden[:, :num_draft, :].contiguous()  # [B, num_draft, hidden]
+        else:
+            z = draft_hidden[:, 1:, :].contiguous()  # [B, num_draft, hidden]
         z_flat = z.reshape(bs * num_draft, hidden_size).to(weight.dtype)
         base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
             bs, num_draft, num_org
         )
-
-        draft_model = self.draft_model
-        embed_module = target_model.get_input_embeddings()
 
         # Slot 1: pure base argmax (no v5 bias yet).
         slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
@@ -1118,7 +1126,16 @@ class DFlashWorker:
             )
             draft_input.draft_seq_lens = new_draft_seq_lens
         else:
-            draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            # In decode mode the draft KV cache should NOT include the latest
+            # verified token, because that token is fed as the first query token
+            # of the draft block (matching the reference implementation where
+            # context KV ends strictly before the anchor position).
+            if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+                draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            else:
+                draft_input.draft_seq_lens = (
+                    (batch.seq_lens - 1).clamp(min=0).to(dtype=torch.int32)
+                )
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
 

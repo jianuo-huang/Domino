@@ -474,5 +474,8 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        if hasattr(self, "prefix_gru") and self.prefix_gru is not None:
+            self.prefix_gru.flatten_parameters()
+
 
 EntryClass = DFlashDraftModel
