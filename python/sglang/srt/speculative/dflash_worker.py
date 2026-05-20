@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import time
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -30,6 +31,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.dflash_v5_kernels import (
     fused_gru_cell,
+    fused_gru_cell_from_table,
     fused_silu_fc2_argmax,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -902,14 +904,18 @@ class DFlashWorker:
         logits_dtype: torch.dtype,
         device: torch.device,
         state: dict,
-        embed_module,
-        gru_input_table: torch.Tensor | None,
+        gru_input_table: torch.Tensor,
+        hidden_size: int,
+        lm_head_weight: torch.Tensor,
     ):
         """Capture (or return cached) CUDA graph for the 13-iteration v5 rollout loop.
 
-        Pool keyed by bs so concurrency 1/4/8/16 each get their own graph.
-        Static buffers (z_proj_all, base_logits, gru_h_in, out) are filled with
-        copy_() before replay; out is read after replay.
+        Pool keyed by (bs, num_draft, dims, dtypes, fused-toggles) so each
+        concurrency/dtype combination gets its own graph. Static buffers
+        (z_proj_all, base_logits, gru_h_in, out) are filled with copy_() before
+        replay; out is read after replay. The entry holds an `_static_refs`
+        list pinning every tensor referenced by the captured graph so the
+        caching allocator cannot recycle their bytes.
 
         Two backends, selected by env DFLASH_V5_FUSED:
           - "0" (default): pure cuBLAS+elementwise loop (verified, loop ~1.92ms)
@@ -919,11 +925,31 @@ class DFlashWorker:
         if pool is None:
             pool = {}
             self._v5_loop_graph_pool = pool
-        entry = pool.get(bs)
+        use_fused = os.environ.get("DFLASH_V5_FUSED") == "1"
+        use_table_fused = os.environ.get("DFLASH_V5_GRU_TABLE_FUSED", "1") == "1"
+        use_full_graph = os.environ.get("DFLASH_V5_FULL_GRAPH") == "1"
+        # CUDA graph baked-in pointers must outlive the entry; the cache key
+        # therefore includes every shape/dtype/branch toggle that changes the
+        # captured node set. (bs alone would alias different num_draft / dtype
+        # configurations onto the same dangling-graph entry.)
+        pool_key = (
+            bs,
+            num_draft,
+            emb_dim,
+            gru_hidden,
+            num_org,
+            org_vocab_start,
+            z_dtype,
+            logits_dtype,
+            use_fused,
+            use_table_fused,
+            use_full_graph,
+            hidden_size,
+        )
+        entry = pool.get(pool_key)
         if entry is not None:
             return entry
 
-        use_fused = os.environ.get("DFLASH_V5_FUSED") == "1"
         G = gru_hidden
 
         # Inputs (filled by copy_ before replay).
@@ -939,8 +965,19 @@ class DFlashWorker:
         if use_fused:
             block_v = 512
             num_v_blocks_shard = (num_org + block_v - 1) // block_v
-            s_proj_buf = torch.empty((bs, emb_dim), dtype=z_dtype, device=device)
-            gh_buf = torch.empty((bs, 3 * G), dtype=z_dtype, device=device)
+            # DFLASH_V5_GRU_TABLE_FUSED=1 (default) inlines index_select into the
+            # GRU cell kernel; "0" falls back to the original index_select + fused_gru_cell.
+            w_s_T = state["w_s"].T.contiguous()
+            w_hh_T = state["w_hh"].T.contiguous()
+            # Merge the two per-step GEMMs (h @ w_s_T -> s_proj, h @ w_hh_T -> gh)
+            # into one wider matmul [G] x [G, emb_dim + 3G]. Same input, same
+            # math; cuts a launch and lets cuBLAS pick a better tile.
+            w_sh_T = torch.cat([w_s_T, w_hh_T], dim=1).contiguous()
+            sh_buf = torch.empty(
+                (bs, emb_dim + 3 * G), dtype=z_dtype, device=device
+            )
+            s_proj_buf = sh_buf[:, :emb_dim]
+            gh_buf = sh_buf[:, emb_dim:]
             h_new_buf = torch.empty((bs, G), dtype=z_dtype, device=device)
             argmax_val_buf = torch.empty(
                 (bs, num_v_blocks_shard), dtype=torch.float32, device=device,
@@ -949,7 +986,10 @@ class DFlashWorker:
                 (bs, num_v_blocks_shard), dtype=torch.int32, device=device,
             )
             local_tok_buf = torch.empty((bs,), dtype=torch.long, device=device)
-            gi_buf = torch.empty((bs, 3 * G), dtype=z_dtype, device=device)
+            gi_buf = (
+                None if use_table_fused
+                else torch.empty((bs, 3 * G), dtype=z_dtype, device=device)
+            )
             fc2_w_shard = state["fc2_weight"][
                 org_vocab_start:org_vocab_start + num_org
             ].contiguous()
@@ -959,13 +999,33 @@ class DFlashWorker:
                 ].contiguous()
                 if state["fc2_bias"] is not None else None
             )
-            w_s_T = state["w_s"].T.contiguous()
-            w_hh_T = state["w_hh"].T.contiguous()
+            b_hh_static = state["b_hh"]
+
+            # Every tensor below is read by baked-in pointers inside the captured
+            # graph. Without an explicit reference held by `entry`, the PyTorch
+            # caching allocator is free to hand these CUDA bytes to other ops
+            # once this function returns, which surfaces as illegal-memory-access
+            # on the second replay. Keep this list complete.
+            static_refs = [
+                z_proj_buf, base_logits_buf, gru_h_buf, out_buf,
+                sh_buf, h_new_buf,
+                argmax_val_buf, argmax_idx_buf, local_tok_buf,
+                fc2_w_shard, w_sh_T,
+                gru_input_table,
+            ]
+            if fc2_b_shard is not None:
+                static_refs.append(fc2_b_shard)
+            if b_hh_static is not None:
+                static_refs.append(b_hh_static)
+            if gi_buf is not None:
+                static_refs.append(gi_buf)
 
             def run_loop(out_target):
                 h_state = gru_h_buf
                 for k in range(1, num_draft):
-                    torch.matmul(h_state, w_s_T, out=s_proj_buf)
+                    # Single GEMM produces both s_proj (emb_dim) and gh (3*G);
+                    # views s_proj_buf / gh_buf alias slices of sh_buf.
+                    torch.matmul(h_state, w_sh_T, out=sh_buf)
                     fused_silu_fc2_argmax(
                         z_proj=z_proj_buf[:, k, :],
                         s_proj=s_proj_buf,
@@ -980,28 +1040,52 @@ class DFlashWorker:
                     tok_full = local_tok_buf + org_vocab_start
                     out_target[:, k] = tok_full
                     if k + 1 < num_draft:
-                        torch.index_select(
-                            gru_input_table, 0, tok_full, out=gi_buf
-                        )
-                        torch.matmul(h_state, w_hh_T, out=gh_buf)
-                        if state["b_hh"] is not None:
-                            gh_buf.add_(state["b_hh"])
-                        fused_gru_cell(
-                            gi=gi_buf, gh=gh_buf,
-                            h_state=h_state, h_out=h_new_buf,
-                        )
+                        if b_hh_static is not None:
+                            gh_buf.add_(b_hh_static)
+                        if use_table_fused:
+                            fused_gru_cell_from_table(
+                                tok_full=tok_full,
+                                gru_input_table=gru_input_table,
+                                gh=gh_buf,
+                                h_state=h_state, h_out=h_new_buf,
+                            )
+                        else:
+                            torch.index_select(
+                                gru_input_table, 0, tok_full, out=gi_buf
+                            )
+                            fused_gru_cell(
+                                gi=gi_buf, gh=gh_buf,
+                                h_state=h_state, h_out=h_new_buf,
+                            )
                         h_state = h_new_buf
         else:
             # Pure cuBLAS+elementwise version (verified to work).
+            # Optimization: replace per-step `embed_module(tok)` + `F.linear(W_ih)`
+            # with a single `index_select(gru_input_table)`. The table is
+            # `embed_weight @ W_ih.T + b_ih`, precomputed once per model load.
+            w_s_static = state["w_s"]
+            w_hh_static = state["w_hh"]
+            b_hh_static = state["b_hh"]
+            fc2_w_static = state["fc2_weight"]
+            fc2_b_static = state["fc2_bias"]
+            static_refs = [
+                z_proj_buf, base_logits_buf, gru_h_buf, out_buf,
+                w_s_static, w_hh_static, fc2_w_static, gru_input_table,
+            ]
+            if b_hh_static is not None:
+                static_refs.append(b_hh_static)
+            if fc2_b_static is not None:
+                static_refs.append(fc2_b_static)
+
             def run_loop(out_target):
                 gru_h_local = gru_h_buf.clone()
                 for k in range(1, num_draft):
                     s_proj = torch.nn.functional.linear(
-                        gru_h_local, state["w_s"], None
+                        gru_h_local, w_s_static, None
                     )
                     mid = torch.nn.functional.silu(z_proj_buf[:, k, :] + s_proj)
                     bias_k = torch.nn.functional.linear(
-                        mid, state["fc2_weight"], state["fc2_bias"]
+                        mid, fc2_w_static, fc2_b_static
                     )
                     shard_end = org_vocab_start + num_org
                     bias_local = bias_k[:, org_vocab_start:shard_end]
@@ -1010,27 +1094,94 @@ class DFlashWorker:
                     tok = (local_arg + org_vocab_start).to(torch.long)
                     out_target[:, k] = tok
                     if k + 1 < num_draft:
-                        new_embed = embed_module(tok).to(z_dtype)
-                        gi = torch.nn.functional.linear(
-                            new_embed, state["w_ih"], state["b_ih"]
-                        )
+                        gi = torch.index_select(gru_input_table, 0, tok)
                         gh = torch.nn.functional.linear(
-                            gru_h_local, state["w_hh"], state["b_hh"]
+                            gru_h_local, w_hh_static, b_hh_static
                         )
                         r = torch.sigmoid(gi[:, :G] + gh[:, :G])
                         z_gate = torch.sigmoid(gi[:, G:2 * G] + gh[:, G:2 * G])
                         n = torch.tanh(gi[:, 2 * G:] + r * gh[:, 2 * G:])
                         gru_h_local = (1.0 - z_gate) * n + z_gate * gru_h_local
 
+        # When DFLASH_V5_FULL_GRAPH=1 we extend the graph upward to also cover
+        # base_logits, slot_1 argmax, the 2-step GRU init, and z_proj_all. The
+        # graph then takes (z, verified_id) instead of (z_proj, base_logits,
+        # gru_h) as inputs, eliminating the eager-side launches that profiling
+        # showed as residual overhead (~0.85ms outside the loop).
+        if use_full_graph:
+            z_buf = torch.empty(
+                (bs, num_draft, hidden_size), dtype=z_dtype, device=device
+            )
+            verified_id_buf = torch.empty((bs,), dtype=torch.long, device=device)
+            slot_1_local_buf = torch.empty((bs,), dtype=torch.long, device=device)
+            slot_1_buf = torch.empty((bs,), dtype=torch.long, device=device)
+            h_init_a = torch.empty((bs, G), dtype=z_dtype, device=device)
+            h_init_b = torch.empty((bs, G), dtype=z_dtype, device=device)
+            gh_init_buf = torch.empty((bs, 3 * G), dtype=z_dtype, device=device)
+
+            lm_head_T = lm_head_weight[:num_org].T.contiguous()
+            w_z_T = state["w_z"].T.contiguous()
+            w_hh_T_init = state["w_hh"].T.contiguous()
+            b1_static = state["b1"]
+
+            full_static_refs = list(static_refs) + [
+                z_buf, verified_id_buf,
+                slot_1_local_buf, slot_1_buf,
+                h_init_a, h_init_b, gh_init_buf,
+                lm_head_T, w_z_T, w_hh_T_init,
+            ]
+            if b1_static is not None:
+                full_static_refs.append(b1_static)
+
+            def run_full(out_target):
+                # 1) Dense base logits over the org-vocab shard.
+                torch.matmul(z_buf, lm_head_T, out=base_logits_buf)
+                # 2) slot_1 = argmax(base_logits[:, 0]) + org_vocab_start.
+                torch.argmax(base_logits_buf[:, 0, :], dim=-1, out=slot_1_local_buf)
+                torch.add(slot_1_local_buf, org_vocab_start, out=slot_1_buf)
+                out_target[:, 0] = slot_1_buf
+                # 3) Manual 2-step GRU init via gru_input_table lookups.
+                gi_v = torch.index_select(gru_input_table, 0, verified_id_buf)
+                gi_s = torch.index_select(gru_input_table, 0, slot_1_buf)
+                h_init_a.zero_()
+                h_in = h_init_a
+                h_out = h_init_b
+                for gi_t in (gi_v, gi_s):
+                    torch.matmul(h_in, w_hh_T_init, out=gh_init_buf)
+                    if b_hh_static is not None:
+                        gh_init_buf.add_(b_hh_static)
+                    gi_r = gi_t[:, :G]
+                    gi_z = gi_t[:, G:2 * G]
+                    gi_n = gi_t[:, 2 * G:]
+                    gh_r = gh_init_buf[:, :G]
+                    gh_z = gh_init_buf[:, G:2 * G]
+                    gh_n = gh_init_buf[:, 2 * G:]
+                    r = torch.sigmoid(gi_r + gh_r)
+                    z_gate = torch.sigmoid(gi_z + gh_z)
+                    n = torch.tanh(gi_n + r * gh_n)
+                    h_new = (1.0 - z_gate) * n + z_gate * h_in
+                    h_out.copy_(h_new)
+                    h_in, h_out = h_out, h_in
+                gru_h_buf.copy_(h_in)
+                # 4) z_proj_all = z @ w_z.T (+ b1).
+                torch.matmul(z_buf, w_z_T, out=z_proj_buf)
+                if b1_static is not None:
+                    z_proj_buf.add_(b1_static)
+                # 5) The original 14-step loop.
+                run_loop(out_target)
+        else:
+            full_static_refs = static_refs
+            run_full = run_loop  # kept for symmetry; outer code branches on use_full_graph
+
         # Warmup outside graph.
         warmup_out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
         for _ in range(2):
-            run_loop(warmup_out)
+            run_full(warmup_out)
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            run_loop(out_buf)
+            run_full(out_buf)
 
         entry = {
             "graph": graph,
@@ -1038,8 +1189,16 @@ class DFlashWorker:
             "base_logits_buf": base_logits_buf,
             "gru_h_buf": gru_h_buf,
             "out_buf": out_buf,
+            # Holds Python references to every tensor with a baked-in pointer
+            # inside the captured graph. Without this, locals here go out of
+            # scope and the caching allocator may reuse their CUDA bytes,
+            # causing illegal memory access on graph replay.
+            "_static_refs": full_static_refs,
         }
-        pool[bs] = entry
+        if use_full_graph:
+            entry["z_buf"] = z_buf
+            entry["verified_id_buf"] = verified_id_buf
+        pool[pool_key] = entry
         logger.warning(
             "[DFLASH v5] captured CUDA graph (%s) for v5 rollout loop bs=%d num_draft=%d",
             "Triton-fused" if use_fused else "cuBLAS",
@@ -1136,8 +1295,36 @@ class DFlashWorker:
                     "evt_init_end": torch.cuda.Event(enable_timing=True),
                     "evt_loop_start": torch.cuda.Event(enable_timing=True),
                     "evt_loop_end": torch.cuda.Event(enable_timing=True),
+                    "last_call_ts": None,
+                    "warmup_reset_done": False,
                 }
                 self._v5_prof = prof
+            # Optional one-shot reset after the first idle gap > 1s. The bench
+            # script's /flush_cache + warmup loop creates exactly such a gap
+            # before the timed phase starts; this lets prof totals reflect
+            # only the timed-phase rollouts. Off by default.
+            reset_after_warmup = os.environ.get(
+                "DFLASH_PROF_V5_RESET_AFTER_WARMUP"
+            ) == "1"
+            now_ts = time.perf_counter()
+            if (
+                reset_after_warmup
+                and not prof["warmup_reset_done"]
+                and prof["last_call_ts"] is not None
+                and now_ts - prof["last_call_ts"] > 1.0
+                and prof["n"] > 0
+            ):
+                prof["n"] = 0
+                prof["base_logits_ms"] = 0.0
+                prof["init_gru_ms"] = 0.0
+                prof["loop_ms"] = 0.0
+                prof["total_ms"] = 0.0
+                prof["warmup_reset_done"] = True
+                logger.warning(
+                    "[DFLASH v5 prof] reset counters after %.2fs idle gap (warmup boundary)",
+                    now_ts - prof["last_call_ts"],
+                )
+            prof["last_call_ts"] = now_ts
             prof["evt_total_start"].record()
             prof["evt_base_start"].record()
 
@@ -1150,58 +1337,87 @@ class DFlashWorker:
             z = draft_hidden[:, :num_draft, :].contiguous()  # [B, num_draft, hidden]
         else:
             z = draft_hidden[:, 1:, :].contiguous()  # [B, num_draft, hidden]
-        z_flat = z.reshape(bs * num_draft, hidden_size).to(weight.dtype)
-        base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
-            bs, num_draft, num_org
-        )
-        if prof_enabled:
-            prof["evt_base_end"].record()
-            prof["evt_init_start"].record()
-
-        # Slot 1: pure base argmax (no v5 bias yet).
-        slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
-        slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
-
-        # Initialize GRU from [verified_id, slot_1].
-        prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)  # [B, 2]
-        prefix_embeds = embed_module(prefix_ids).to(z.dtype)
-        gru_h = draft_model.v5_init_gru_hidden(prefix_embeds)  # [B, gru_hidden_dim]
 
         state = draft_model.get_v5_rollout_state()
         G = state["gru_hidden_size"]
-        # Precompute the z-projection part of fc1: out = SiLU(z @ W_z + s @ W_s + b1) @ W_fc2 + b_fc2.
-        # Materialize z @ W_z + b1 once for all steps (b1 may be None — F.linear handles that).
-        z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])  # [B, num_draft, emb_dim]
-        if prof_enabled:
-            prof["evt_init_end"].record()
-            prof["evt_loop_start"].record()
+        emb_dim = int(state["w_z"].shape[0])
+        z_for_dtype = z.to(weight.dtype) if z.dtype != weight.dtype else z
+        gru_input_table = draft_model.get_v5_gru_input_proj_table(
+            embed_module.weight
+        )
 
-        emb_dim = z_proj_all.shape[-1]
-        use_fused = os.environ.get("DFLASH_V5_FUSED") == "1"
-        gru_input_table = (
-            draft_model.get_v5_gru_input_proj_table(embed_module.weight)
-            if use_fused else None
-        )
-        graph_entry = self._get_or_capture_v5_loop_graph(
-            bs=bs,
-            num_draft=num_draft,
-            emb_dim=emb_dim,
-            gru_hidden=G,
-            num_org=num_org,
-            org_vocab_start=org_vocab_start,
-            z_dtype=z.dtype,
-            logits_dtype=base_logits.dtype,
-            device=device,
-            state=state,
-            embed_module=embed_module,
-            gru_input_table=gru_input_table,
-        )
-        graph_entry["z_proj_buf"].copy_(z_proj_all)
-        graph_entry["base_logits_buf"].copy_(base_logits)
-        graph_entry["gru_h_buf"].copy_(gru_h)
-        graph_entry["out_buf"][:, 0].copy_(slot_1)
-        graph_entry["graph"].replay()
-        out = graph_entry["out_buf"]
+        use_full_graph = os.environ.get("DFLASH_V5_FULL_GRAPH") == "1"
+
+        if not use_full_graph:
+            # Original eager-prologue path.
+            z_flat = z_for_dtype.reshape(bs * num_draft, hidden_size)
+            base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
+                bs, num_draft, num_org
+            )
+            if prof_enabled:
+                prof["evt_base_end"].record()
+                prof["evt_init_start"].record()
+
+            slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
+            slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
+
+            prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
+            prefix_embeds = embed_module(prefix_ids).to(z.dtype)
+            gru_h = draft_model.v5_init_gru_hidden(prefix_embeds)
+
+            z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
+            if prof_enabled:
+                prof["evt_init_end"].record()
+                prof["evt_loop_start"].record()
+
+            graph_entry = self._get_or_capture_v5_loop_graph(
+                bs=bs,
+                num_draft=num_draft,
+                emb_dim=emb_dim,
+                gru_hidden=G,
+                num_org=num_org,
+                org_vocab_start=org_vocab_start,
+                z_dtype=z.dtype,
+                logits_dtype=base_logits.dtype,
+                device=device,
+                state=state,
+                gru_input_table=gru_input_table,
+                hidden_size=hidden_size,
+                lm_head_weight=weight,
+            )
+            graph_entry["z_proj_buf"].copy_(z_proj_all)
+            graph_entry["base_logits_buf"].copy_(base_logits)
+            graph_entry["gru_h_buf"].copy_(gru_h)
+            graph_entry["out_buf"][:, 0].copy_(slot_1)
+            graph_entry["graph"].replay()
+            out = graph_entry["out_buf"]
+        else:
+            # Full-graph path: base_logits, slot_1, GRU init, z_proj all run
+            # inside the captured graph. We only feed z and verified_id.
+            if prof_enabled:
+                prof["evt_base_end"].record()
+                prof["evt_init_start"].record()
+                prof["evt_init_end"].record()
+                prof["evt_loop_start"].record()
+            graph_entry = self._get_or_capture_v5_loop_graph(
+                bs=bs,
+                num_draft=num_draft,
+                emb_dim=emb_dim,
+                gru_hidden=G,
+                num_org=num_org,
+                org_vocab_start=org_vocab_start,
+                z_dtype=z.dtype,
+                logits_dtype=weight.dtype,
+                device=device,
+                state=state,
+                gru_input_table=gru_input_table,
+                hidden_size=hidden_size,
+                lm_head_weight=weight,
+            )
+            graph_entry["z_buf"].copy_(z_for_dtype)
+            graph_entry["verified_id_buf"].copy_(verified_id.to(torch.long))
+            graph_entry["graph"].replay()
+            out = graph_entry["out_buf"]
 
         if prof_enabled:
             prof["evt_loop_end"].record()

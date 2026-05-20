@@ -265,3 +265,97 @@ def fused_gru_cell(
         h_out.stride(0), h_out.stride(1),
         BLOCK_G=block_g,
     )
+
+
+@triton.jit
+def _v5_fused_gru_cell_from_table_kernel(
+    tok_ptr, table_ptr, gh_ptr, h_ptr, h_out_ptr,
+    G, V,
+    stride_table_v, stride_table_g,
+    stride_gh_b, stride_gh_g,
+    stride_h_b, stride_h_g,
+    stride_hout_b, stride_hout_g,
+    BLOCK_G: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    offs_g = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    mask_g = offs_g < G
+
+    tok_id_raw = tl.load(tok_ptr + pid_b)
+    tok_in_range = (tok_id_raw >= 0) & (tok_id_raw < V)
+    tok_id = tl.where(tok_in_range, tok_id_raw, 0)
+    mask_tok = mask_g & tok_in_range
+
+    h_state = tl.load(
+        h_ptr + pid_b * stride_h_b + offs_g * stride_h_g,
+        mask=mask_g, other=0.0,
+    ).to(tl.float32)
+
+    row_base = tok_id * stride_table_v
+    gi_r = tl.load(
+        table_ptr + row_base + offs_g * stride_table_g,
+        mask=mask_tok, other=0.0,
+    ).to(tl.float32)
+    gi_z = tl.load(
+        table_ptr + row_base + (G + offs_g) * stride_table_g,
+        mask=mask_tok, other=0.0,
+    ).to(tl.float32)
+    gi_n = tl.load(
+        table_ptr + row_base + (2 * G + offs_g) * stride_table_g,
+        mask=mask_tok, other=0.0,
+    ).to(tl.float32)
+
+    gh_r = tl.load(
+        gh_ptr + pid_b * stride_gh_b + offs_g * stride_gh_g,
+        mask=mask_g, other=0.0,
+    ).to(tl.float32)
+    gh_z = tl.load(
+        gh_ptr + pid_b * stride_gh_b + (G + offs_g) * stride_gh_g,
+        mask=mask_g, other=0.0,
+    ).to(tl.float32)
+    gh_n = tl.load(
+        gh_ptr + pid_b * stride_gh_b + (2 * G + offs_g) * stride_gh_g,
+        mask=mask_g, other=0.0,
+    ).to(tl.float32)
+
+    r = tl.sigmoid(gi_r + gh_r)
+    z = tl.sigmoid(gi_z + gh_z)
+    n = 2.0 * tl.sigmoid(2.0 * (gi_n + r * gh_n)) - 1.0
+    h_new = (1.0 - z) * n + z * h_state
+
+    tl.store(
+        h_out_ptr + pid_b * stride_hout_b + offs_g * stride_hout_g,
+        h_new.to(h_ptr.dtype.element_ty),
+        mask=mask_g,
+    )
+
+
+def fused_gru_cell_from_table(
+    *,
+    tok_full: torch.Tensor,       # [B] int64 token ids (already shifted by org_vocab_start)
+    gru_input_table: torch.Tensor,  # [V, 3*G] precomputed embed @ W_ih.T + b_ih
+    gh: torch.Tensor,             # [B, 3*G] h_state @ W_hh.T (+ b_hh)
+    h_state: torch.Tensor,        # [B, G]
+    h_out: torch.Tensor,          # [B, G] destination
+    block_g: int = 256,
+) -> None:
+    """Fused: gi = gru_input_table[tok_full]; then GRU cell update.
+
+    Replaces the index_select + fused_gru_cell pair with a single kernel that
+    reads gi directly from the table by tok id, skipping the gi_buf materialize.
+    """
+    B = tok_full.shape[0]
+    G = h_state.shape[1]
+    V = gru_input_table.shape[0]
+    grid = (B, (G + block_g - 1) // block_g)
+    _v5_fused_gru_cell_from_table_kernel[grid](
+        tok_full, gru_input_table, gh, h_state, h_out,
+        G, V,
+        gru_input_table.stride(0), gru_input_table.stride(1),
+        gh.stride(0), gh.stride(1),
+        h_state.stride(0), h_state.stride(1),
+        h_out.stride(0), h_out.stride(1),
+        BLOCK_G=block_g,
+    )
