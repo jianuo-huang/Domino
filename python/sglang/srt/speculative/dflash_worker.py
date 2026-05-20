@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -26,6 +27,10 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
+)
+from sglang.srt.speculative.dflash_v5_kernels import (
+    fused_gru_cell,
+    fused_silu_fc2_argmax,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -884,6 +889,164 @@ class DFlashWorker:
 
         return out_token_ids
 
+    def _get_or_capture_v5_loop_graph(
+        self,
+        *,
+        bs: int,
+        num_draft: int,
+        emb_dim: int,
+        gru_hidden: int,
+        num_org: int,
+        org_vocab_start: int,
+        z_dtype: torch.dtype,
+        logits_dtype: torch.dtype,
+        device: torch.device,
+        state: dict,
+        embed_module,
+        gru_input_table: torch.Tensor | None,
+    ):
+        """Capture (or return cached) CUDA graph for the 13-iteration v5 rollout loop.
+
+        Pool keyed by bs so concurrency 1/4/8/16 each get their own graph.
+        Static buffers (z_proj_all, base_logits, gru_h_in, out) are filled with
+        copy_() before replay; out is read after replay.
+
+        Two backends, selected by env DFLASH_V5_FUSED:
+          - "0" (default): pure cuBLAS+elementwise loop (verified, loop ~1.92ms)
+          - "1": Triton-fused per-step kernel + index_select-based GRU input
+        """
+        pool = getattr(self, "_v5_loop_graph_pool", None)
+        if pool is None:
+            pool = {}
+            self._v5_loop_graph_pool = pool
+        entry = pool.get(bs)
+        if entry is not None:
+            return entry
+
+        use_fused = os.environ.get("DFLASH_V5_FUSED") == "1"
+        G = gru_hidden
+
+        # Inputs (filled by copy_ before replay).
+        z_proj_buf = torch.empty(
+            (bs, num_draft, emb_dim), dtype=z_dtype, device=device
+        )
+        base_logits_buf = torch.empty(
+            (bs, num_draft, num_org), dtype=logits_dtype, device=device
+        )
+        gru_h_buf = torch.empty((bs, G), dtype=z_dtype, device=device)
+        out_buf = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+
+        if use_fused:
+            block_v = 512
+            num_v_blocks_shard = (num_org + block_v - 1) // block_v
+            s_proj_buf = torch.empty((bs, emb_dim), dtype=z_dtype, device=device)
+            gh_buf = torch.empty((bs, 3 * G), dtype=z_dtype, device=device)
+            h_new_buf = torch.empty((bs, G), dtype=z_dtype, device=device)
+            argmax_val_buf = torch.empty(
+                (bs, num_v_blocks_shard), dtype=torch.float32, device=device,
+            )
+            argmax_idx_buf = torch.empty(
+                (bs, num_v_blocks_shard), dtype=torch.int32, device=device,
+            )
+            local_tok_buf = torch.empty((bs,), dtype=torch.long, device=device)
+            gi_buf = torch.empty((bs, 3 * G), dtype=z_dtype, device=device)
+            fc2_w_shard = state["fc2_weight"][
+                org_vocab_start:org_vocab_start + num_org
+            ].contiguous()
+            fc2_b_shard = (
+                state["fc2_bias"][
+                    org_vocab_start:org_vocab_start + num_org
+                ].contiguous()
+                if state["fc2_bias"] is not None else None
+            )
+            w_s_T = state["w_s"].T.contiguous()
+            w_hh_T = state["w_hh"].T.contiguous()
+
+            def run_loop(out_target):
+                h_state = gru_h_buf
+                for k in range(1, num_draft):
+                    torch.matmul(h_state, w_s_T, out=s_proj_buf)
+                    fused_silu_fc2_argmax(
+                        z_proj=z_proj_buf[:, k, :],
+                        s_proj=s_proj_buf,
+                        fc2_weight=fc2_w_shard,
+                        fc2_bias=fc2_b_shard,
+                        base_logits=base_logits_buf[:, k, :],
+                        out_val=argmax_val_buf,
+                        out_idx=argmax_idx_buf,
+                        final_token=local_tok_buf,
+                        block_v=block_v,
+                    )
+                    tok_full = local_tok_buf + org_vocab_start
+                    out_target[:, k] = tok_full
+                    if k + 1 < num_draft:
+                        torch.index_select(
+                            gru_input_table, 0, tok_full, out=gi_buf
+                        )
+                        torch.matmul(h_state, w_hh_T, out=gh_buf)
+                        if state["b_hh"] is not None:
+                            gh_buf.add_(state["b_hh"])
+                        fused_gru_cell(
+                            gi=gi_buf, gh=gh_buf,
+                            h_state=h_state, h_out=h_new_buf,
+                        )
+                        h_state = h_new_buf
+        else:
+            # Pure cuBLAS+elementwise version (verified to work).
+            def run_loop(out_target):
+                gru_h_local = gru_h_buf.clone()
+                for k in range(1, num_draft):
+                    s_proj = torch.nn.functional.linear(
+                        gru_h_local, state["w_s"], None
+                    )
+                    mid = torch.nn.functional.silu(z_proj_buf[:, k, :] + s_proj)
+                    bias_k = torch.nn.functional.linear(
+                        mid, state["fc2_weight"], state["fc2_bias"]
+                    )
+                    shard_end = org_vocab_start + num_org
+                    bias_local = bias_k[:, org_vocab_start:shard_end]
+                    logits_k = base_logits_buf[:, k, :] + bias_local.to(logits_dtype)
+                    local_arg = torch.argmax(logits_k, dim=-1)
+                    tok = (local_arg + org_vocab_start).to(torch.long)
+                    out_target[:, k] = tok
+                    if k + 1 < num_draft:
+                        new_embed = embed_module(tok).to(z_dtype)
+                        gi = torch.nn.functional.linear(
+                            new_embed, state["w_ih"], state["b_ih"]
+                        )
+                        gh = torch.nn.functional.linear(
+                            gru_h_local, state["w_hh"], state["b_hh"]
+                        )
+                        r = torch.sigmoid(gi[:, :G] + gh[:, :G])
+                        z_gate = torch.sigmoid(gi[:, G:2 * G] + gh[:, G:2 * G])
+                        n = torch.tanh(gi[:, 2 * G:] + r * gh[:, 2 * G:])
+                        gru_h_local = (1.0 - z_gate) * n + z_gate * gru_h_local
+
+        # Warmup outside graph.
+        warmup_out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+        for _ in range(2):
+            run_loop(warmup_out)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_loop(out_buf)
+
+        entry = {
+            "graph": graph,
+            "z_proj_buf": z_proj_buf,
+            "base_logits_buf": base_logits_buf,
+            "gru_h_buf": gru_h_buf,
+            "out_buf": out_buf,
+        }
+        pool[bs] = entry
+        logger.warning(
+            "[DFLASH v5] captured CUDA graph (%s) for v5 rollout loop bs=%d num_draft=%d",
+            "Triton-fused" if use_fused else "cuBLAS",
+            bs, num_draft,
+        )
+        return entry
+
     def _v5_rollout_draft_block(
         self,
         *,
@@ -903,6 +1066,12 @@ class DFlashWorker:
                  bias = embed_proj(cat(z_k, gru_h))
                  slot_k = argmax(base_logits[k-1] + bias)
                  gru_h = prefix_gru_step(embed(slot_k))
+
+        Implementation note: the per-step embed_proj/GRU calls have non-trivial
+        Python + cuDNN launch overhead.  We pre-split fc1.weight along its input
+        axis so z @ W_z (the part that doesn't depend on the GRU state) is
+        batched outside the loop, and we replace nn.GRU(seq_len=1) with a manual
+        GRU cell to skip cuDNN setup.
 
         Args:
             draft_hidden: [B, block_size, hidden_size] draft model output (post-norm).
@@ -948,6 +1117,30 @@ class DFlashWorker:
         draft_model = self.draft_model
         embed_module = target_model.get_input_embeddings()
 
+        prof_enabled = os.environ.get("DFLASH_PROF_V5") == "1"
+        if prof_enabled:
+            prof = getattr(self, "_v5_prof", None)
+            if prof is None:
+                prof = {
+                    "n": 0,
+                    "base_logits_ms": 0.0,
+                    "init_gru_ms": 0.0,
+                    "loop_ms": 0.0,
+                    "total_ms": 0.0,
+                    "print_every": 50,
+                    "evt_total_start": torch.cuda.Event(enable_timing=True),
+                    "evt_total_end": torch.cuda.Event(enable_timing=True),
+                    "evt_base_start": torch.cuda.Event(enable_timing=True),
+                    "evt_base_end": torch.cuda.Event(enable_timing=True),
+                    "evt_init_start": torch.cuda.Event(enable_timing=True),
+                    "evt_init_end": torch.cuda.Event(enable_timing=True),
+                    "evt_loop_start": torch.cuda.Event(enable_timing=True),
+                    "evt_loop_end": torch.cuda.Event(enable_timing=True),
+                }
+                self._v5_prof = prof
+            prof["evt_total_start"].record()
+            prof["evt_base_start"].record()
+
         # shift_label=True: draft_hidden[:, i, :] predicts token at position i+1.
         # shift_label=False: draft_hidden[:, i, :] predicts token at position i.
         # For the draft block, position 0 is verified_id; positions 1..block_size-1
@@ -961,33 +1154,75 @@ class DFlashWorker:
         base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
             bs, num_draft, num_org
         )
+        if prof_enabled:
+            prof["evt_base_end"].record()
+            prof["evt_init_start"].record()
 
         # Slot 1: pure base argmax (no v5 bias yet).
         slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
         slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
-
-        out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
-        out[:, 0] = slot_1
 
         # Initialize GRU from [verified_id, slot_1].
         prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)  # [B, 2]
         prefix_embeds = embed_module(prefix_ids).to(z.dtype)
         gru_h = draft_model.v5_init_gru_hidden(prefix_embeds)  # [B, gru_hidden_dim]
 
-        # Sequential rollout for slots 2..num_draft.
-        for k in range(1, num_draft):
-            z_k = z[:, k, :]  # [B, hidden]
-            bias_k = draft_model.v5_compute_bias(z_k, gru_h)  # [B, vocab]
-            # Slice bias to the shard's base vocab range (TP=1 + no added vocab).
-            shard_end = org_vocab_start + num_org
-            bias_local = bias_k[:, org_vocab_start:shard_end]
-            logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
-            local_arg = torch.argmax(logits_k, dim=-1)
-            tok = (local_arg + org_vocab_start).to(torch.long)
-            out[:, k] = tok
-            if k + 1 < num_draft:
-                new_embed = embed_module(tok).to(z.dtype)
-                gru_h = draft_model.v5_step_gru_hidden(new_embed, gru_h)
+        state = draft_model.get_v5_rollout_state()
+        G = state["gru_hidden_size"]
+        # Precompute the z-projection part of fc1: out = SiLU(z @ W_z + s @ W_s + b1) @ W_fc2 + b_fc2.
+        # Materialize z @ W_z + b1 once for all steps (b1 may be None — F.linear handles that).
+        z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])  # [B, num_draft, emb_dim]
+        if prof_enabled:
+            prof["evt_init_end"].record()
+            prof["evt_loop_start"].record()
+
+        emb_dim = z_proj_all.shape[-1]
+        use_fused = os.environ.get("DFLASH_V5_FUSED") == "1"
+        gru_input_table = (
+            draft_model.get_v5_gru_input_proj_table(embed_module.weight)
+            if use_fused else None
+        )
+        graph_entry = self._get_or_capture_v5_loop_graph(
+            bs=bs,
+            num_draft=num_draft,
+            emb_dim=emb_dim,
+            gru_hidden=G,
+            num_org=num_org,
+            org_vocab_start=org_vocab_start,
+            z_dtype=z.dtype,
+            logits_dtype=base_logits.dtype,
+            device=device,
+            state=state,
+            embed_module=embed_module,
+            gru_input_table=gru_input_table,
+        )
+        graph_entry["z_proj_buf"].copy_(z_proj_all)
+        graph_entry["base_logits_buf"].copy_(base_logits)
+        graph_entry["gru_h_buf"].copy_(gru_h)
+        graph_entry["out_buf"][:, 0].copy_(slot_1)
+        graph_entry["graph"].replay()
+        out = graph_entry["out_buf"]
+
+        if prof_enabled:
+            prof["evt_loop_end"].record()
+            prof["evt_total_end"].record()
+            torch.cuda.synchronize()
+            prof["base_logits_ms"] += prof["evt_base_start"].elapsed_time(prof["evt_base_end"])
+            prof["init_gru_ms"] += prof["evt_init_start"].elapsed_time(prof["evt_init_end"])
+            prof["loop_ms"] += prof["evt_loop_start"].elapsed_time(prof["evt_loop_end"])
+            prof["total_ms"] += prof["evt_total_start"].elapsed_time(prof["evt_total_end"])
+            prof["n"] += 1
+            if prof["n"] % prof["print_every"] == 0:
+                n = prof["n"]
+                logger.warning(
+                    "[DFLASH v5 prof] bs=%d n_calls=%d "
+                    "total=%.3fms base_logits=%.3fms init_gru=%.3fms loop(14step)=%.3fms",
+                    bs, n,
+                    prof["total_ms"] / n,
+                    prof["base_logits_ms"] / n,
+                    prof["init_gru_ms"] / n,
+                    prof["loop_ms"] / n,
+                )
 
         return out
 

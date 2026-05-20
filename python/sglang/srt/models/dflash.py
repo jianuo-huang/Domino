@@ -371,6 +371,81 @@ class DFlashDraftModel(nn.Module):
         """
         return self.embed_proj(torch.cat([z, gru_h], dim=-1))
 
+    def get_v5_rollout_state(self) -> dict:
+        """Return cached weight views used by the optimized v5 rollout loop.
+
+        We split fc1.weight along its input axis so the z-projection can be
+        batched outside the per-step loop, and expose the manual GRU cell
+        weights so the rollout can skip nn.GRU(seq_len=1) launch overhead.
+        Cached lazily on the first call; cleared by `reset_v5_rollout_state`
+        if the underlying weights are re-loaded.
+        """
+        state = getattr(self, "_v5_rollout_state_cache", None)
+        if state is not None:
+            return state
+        if getattr(self, "projector_type", None) != "causal_v5":
+            raise RuntimeError(
+                "get_v5_rollout_state called on a non causal_v5 draft model."
+            )
+
+        fc1 = self.embed_proj[0]
+        fc2 = self.embed_proj[2]
+        hidden_dim = int(self.config.hidden_size)
+        # fc1.weight is [emb_dim, hidden + gru_hidden]; split along input axis.
+        w_z = fc1.weight[:, :hidden_dim].detach()
+        w_s = fc1.weight[:, hidden_dim:].detach()
+        b1 = fc1.bias.detach() if fc1.bias is not None else None
+
+        gru = self.prefix_gru
+        w_ih = gru.weight_ih_l0.detach()
+        w_hh = gru.weight_hh_l0.detach()
+        b_ih = gru.bias_ih_l0.detach() if gru.bias else None
+        b_hh = gru.bias_hh_l0.detach() if gru.bias else None
+
+        state = {
+            "w_z": w_z,
+            "w_s": w_s,
+            "b1": b1,
+            "fc2_weight": fc2.weight.detach(),
+            "fc2_bias": fc2.bias.detach() if fc2.bias is not None else None,
+            "w_ih": w_ih,
+            "w_hh": w_hh,
+            "b_ih": b_ih,
+            "b_hh": b_hh,
+            "gru_hidden_size": int(gru.hidden_size),
+        }
+        self._v5_rollout_state_cache = state
+        return state
+
+    def get_v5_gru_input_proj_table(self, embed_weight: torch.Tensor) -> torch.Tensor:
+        """Return [vocab, 3*gru_hidden] precomputed table: embed_weight @ W_ih.T + b_ih.
+
+        Cached on first call. Used by the fused GRU rollout kernel to skip the
+        per-step `embed_tokens(tok)` + `W_ih @ embed` projection.
+
+        Memory cost: vocab(152K) * 3 * 1024 * 2B ≈ 0.87 GB (bf16). Keyed by the
+        embed_weight data_ptr so a re-load of the target model invalidates the
+        cache automatically.
+        """
+        cached = getattr(self, "_v5_gru_input_table_cache", None)
+        if cached is not None and cached["weight_ptr"] == embed_weight.data_ptr():
+            return cached["table"]
+        state = self.get_v5_rollout_state()
+        table = torch.nn.functional.linear(
+            embed_weight, state["w_ih"], state["b_ih"]
+        ).contiguous()
+        self._v5_gru_input_table_cache = {
+            "weight_ptr": embed_weight.data_ptr(),
+            "table": table,
+        }
+        return table
+
+    def reset_v5_rollout_state(self) -> None:
+        if hasattr(self, "_v5_rollout_state_cache"):
+            self._v5_rollout_state_cache = None
+        if hasattr(self, "_v5_gru_input_table_cache"):
+            self._v5_gru_input_table_cache = None
+
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
         expected = int(self.fc.in_features)
