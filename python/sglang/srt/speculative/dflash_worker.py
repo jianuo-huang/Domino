@@ -1126,16 +1126,14 @@ class DFlashWorker:
             )
             draft_input.draft_seq_lens = new_draft_seq_lens
         else:
-            # In decode mode the draft KV cache should NOT include the latest
-            # verified token, because that token is fed as the first query token
-            # of the draft block (matching the reference implementation where
-            # context KV ends strictly before the anchor position).
-            if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-                draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-            else:
-                draft_input.draft_seq_lens = (
-                    (batch.seq_lens - 1).clamp(min=0).to(dtype=torch.int32)
-                )
+            # The draft KV cache must reflect the exact number of committed tokens.
+            # In extend mode this is the prompt length; in decode mode it is the
+            # current target seq_len (all committed tokens including the latest
+            # bonus/verified token).  The draft model will recompute the verified
+            # token as the first query of the next block, but the cache length
+            # itself must stay consistent with req_to_token so attention sees the
+            # correct prefix.
+            draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
 
