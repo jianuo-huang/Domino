@@ -996,30 +996,27 @@ class DFlashWorker:
         list pinning every tensor referenced by the captured graph so the
         caching allocator cannot recycle their bytes.
 
-        Two backends, selected by env DFLASH_V5_FUSED:
-          - "0" (default): pure cuBLAS+elementwise loop (verified, loop ~1.92ms)
-          - "1": Triton-fused per-step kernel + index_select-based GRU input
+        Uses the current best v5 rollout path by default: Triton fused scoring,
+        table-based GRU input, in-kernel GRU bias, CUDA graph replay, and an
+        optional candidate pool for bias scoring.
         """
         pool = getattr(self, "_v5_loop_graph_pool", None)
         if pool is None:
             pool = {}
             self._v5_loop_graph_pool = pool
-        use_fused = os.environ.get("DFLASH_V5_FUSED") == "1"
-        use_table_fused = os.environ.get("DFLASH_V5_GRU_TABLE_FUSED", "1") == "1"
-        use_gru_bias_fused = os.environ.get("DFLASH_V5_GRU_BIAS_FUSED", "1") == "1"
-        use_precompute_mid = os.environ.get("DFLASH_V5_PRECOMPUTE_MID") == "1"
-        use_full_graph = os.environ.get("DFLASH_V5_FULL_GRAPH") == "1"
+        # Keep the runtime path on the measured best configuration. The older
+        # 0/1 experimental variants are no longer exposed as production knobs.
+        use_fused = True
+        use_table_fused = True
+        use_gru_bias_fused = True
+        use_precompute_mid = False
+        use_full_graph = False
         candidate_pool_size = max(0, int(candidate_pool_size))
-        use_candidate_pool = use_fused and candidate_pool_size > 0
-        if use_candidate_pool:
-            # Candidate pool needs base_logits topk from the eager prologue. Keep
-            # this path separate from the broader full-graph experiment.
-            use_full_graph = False
-            use_precompute_mid = False
-        disable_loop_graph = os.environ.get("DFLASH_V5_DISABLE_LOOP_GRAPH") == "1"
-        breakdown_enabled = os.environ.get("DFLASH_V5_LOOP_BREAKDOWN") == "1"
-        ablate_no_gru = os.environ.get("DFLASH_V5_ABLATE_NO_GRU") == "1"
-        ablate_no_score = os.environ.get("DFLASH_V5_ABLATE_NO_SCORE") == "1"
+        use_candidate_pool = candidate_pool_size > 0
+        disable_loop_graph = False
+        breakdown_enabled = False
+        ablate_no_gru = False
+        ablate_no_score = False
         # CUDA graph baked-in pointers must outlive the entry; the cache key
         # therefore includes every shape/dtype/branch toggle that changes the
         # captured node set. (bs alone would alias different num_draft / dtype
@@ -1070,8 +1067,7 @@ class DFlashWorker:
                 (candidate_pool_size + candidate_block_c - 1) // candidate_block_c
                 if use_candidate_pool else num_v_blocks_shard
             )
-            # DFLASH_V5_GRU_TABLE_FUSED=1 (default) inlines index_select into the
-            # GRU cell kernel; "0" falls back to the original index_select + fused_gru_cell.
+            # The measured best path inlines index_select into the GRU cell kernel.
             w_s_T = state["w_s"].T.contiguous()
             w_hh_T = state["w_hh"].T.contiguous()
             # Merge the two per-step GEMMs (h @ w_s_T -> s_proj, h @ w_hh_T -> gh)
@@ -1314,11 +1310,9 @@ class DFlashWorker:
                         n = torch.tanh(gi[:, 2 * G:] + r * gh[:, 2 * G:])
                         gru_h_local = (1.0 - z_gate) * n + z_gate * gru_h_local
 
-        # When DFLASH_V5_FULL_GRAPH=1 we extend the graph upward to also cover
-        # base_logits, slot_1 argmax, the 2-step GRU init, and z_proj_all. The
-        # graph then takes (z, verified_id) instead of (z_proj, base_logits,
-        # gru_h) as inputs, eliminating the eager-side launches that profiling
-        # showed as residual overhead (~0.85ms outside the loop).
+        # The full-graph variant was measured as not materially better than the
+        # eager prologue plus captured rollout loop, so production stays on the
+        # simpler graph boundary.
         if use_full_graph:
             z_buf = torch.empty(
                 (bs, num_draft, hidden_size), dtype=z_dtype, device=device
@@ -1511,26 +1505,17 @@ class DFlashWorker:
             raise RuntimeError("DFLASH lm_head has empty base vocab shard.")
 
         candidate_pool_size = max(
-            0, int(os.environ.get("DFLASH_V5_CANDIDATE_POOL", "0"))
+            0, int(os.environ.get("DFLASH_V5_CANDIDATE_POOL", "1024"))
         )
-        if candidate_pool_size > 0:
-            if os.environ.get("DFLASH_V5_FUSED") != "1":
-                if not getattr(self, "_v5_candidate_requires_fused_warned", False):
-                    logger.warning(
-                        "DFLASH_V5_CANDIDATE_POOL requires DFLASH_V5_FUSED=1; "
-                        "ignoring candidate pool."
-                    )
-                    self._v5_candidate_requires_fused_warned = True
-                candidate_pool_size = 0
-            elif candidate_pool_size >= num_org:
-                if not getattr(self, "_v5_candidate_full_vocab_warned", False):
-                    logger.warning(
-                        "DFLASH_V5_CANDIDATE_POOL=%d is >= local vocab size %d; "
-                        "using full-vocab v5 scoring instead.",
-                        candidate_pool_size, num_org,
-                    )
-                    self._v5_candidate_full_vocab_warned = True
-                candidate_pool_size = 0
+        if candidate_pool_size > 0 and candidate_pool_size >= num_org:
+            if not getattr(self, "_v5_candidate_full_vocab_warned", False):
+                logger.warning(
+                    "DFLASH_V5_CANDIDATE_POOL=%d is >= local vocab size %d; "
+                    "using full-vocab v5 scoring instead.",
+                    candidate_pool_size, num_org,
+                )
+                self._v5_candidate_full_vocab_warned = True
+            candidate_pool_size = 0
 
         draft_model = self.draft_model
         embed_module = target_model.get_input_embeddings()
@@ -1615,15 +1600,7 @@ class DFlashWorker:
             embed_module.weight
         )
 
-        use_full_graph = os.environ.get("DFLASH_V5_FULL_GRAPH") == "1"
-        if candidate_pool_size > 0 and use_full_graph:
-            if not getattr(self, "_v5_candidate_full_graph_warned", False):
-                logger.warning(
-                    "DFLASH_V5_CANDIDATE_POOL is enabled; disabling "
-                    "DFLASH_V5_FULL_GRAPH for this v5 rollout path."
-                )
-                self._v5_candidate_full_graph_warned = True
-            use_full_graph = False
+        use_full_graph = False
 
         if not use_full_graph:
             # Original eager-prologue path.
@@ -1651,8 +1628,8 @@ class DFlashWorker:
 
             prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
 
-            use_fast_init = os.environ.get("DFLASH_V5_FAST_INIT_GRU") == "1"
-            check_init = os.environ.get("DFLASH_V5_FAST_INIT_GRU_CHECK") == "1"
+            use_fast_init = False
+            check_init = False
 
             if use_fast_init or check_init:
                 # Manual 2-step unroll using precomputed gru_input_table.
