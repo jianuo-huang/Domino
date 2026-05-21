@@ -23,6 +23,107 @@ import triton.language as tl
 
 
 @triton.jit
+def _v5_silu_sum_kernel(
+    z_ptr, s_ptr, mid_ptr,
+    M,
+    stride_z_b, stride_z_m,
+    stride_s_b, stride_s_m,
+    stride_mid_b, stride_mid_m,
+    BLOCK_M: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    offs_m = tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    z_block = tl.load(
+        z_ptr + pid_b * stride_z_b + offs_m * stride_z_m,
+        mask=mask_m, other=0.0,
+    ).to(tl.float32)
+    s_block = tl.load(
+        s_ptr + pid_b * stride_s_b + offs_m * stride_s_m,
+        mask=mask_m, other=0.0,
+    ).to(tl.float32)
+    preact = z_block + s_block
+    mid = preact * tl.sigmoid(preact)
+    tl.store(
+        mid_ptr + pid_b * stride_mid_b + offs_m * stride_mid_m,
+        mid.to(mid_ptr.dtype.element_ty),
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _v5_fused_mid_fc2_argmax_kernel(
+    mid_ptr,
+    fc2_ptr, base_ptr, fc2_bias_ptr,
+    out_val_ptr, out_idx_ptr,
+    M, V,
+    stride_mid_b, stride_mid_m,
+    stride_f2_v, stride_f2_m,
+    stride_base_b, stride_base_v,
+    stride_outv_b, stride_outv_n,
+    stride_outi_b, stride_outi_n,
+    BLOCK_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_FC2_BIAS: tl.constexpr,
+):
+    pid_v = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask_v = offs_v < V
+
+    acc = tl.zeros([BLOCK_V], dtype=tl.float32)
+
+    for m_start in range(0, M, BLOCK_M):
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+
+        mid_block = tl.load(
+            mid_ptr + pid_b * stride_mid_b + offs_m * stride_mid_m,
+            mask=mask_m, other=0.0,
+        ).to(tl.float32)
+
+        fc2_ptrs = (
+            fc2_ptr
+            + offs_v[:, None] * stride_f2_v
+            + offs_m[None, :] * stride_f2_m
+        )
+        fc2_block = tl.load(
+            fc2_ptrs,
+            mask=mask_v[:, None] & mask_m[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+
+        acc += tl.sum(fc2_block * mid_block[None, :], axis=1)
+
+    if HAS_FC2_BIAS:
+        bias_block = tl.load(
+            fc2_bias_ptr + offs_v, mask=mask_v, other=0.0
+        ).to(tl.float32)
+        acc += bias_block
+
+    base_block = tl.load(
+        base_ptr + pid_b * stride_base_b + offs_v * stride_base_v,
+        mask=mask_v, other=-float("inf"),
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    acc += base_block
+
+    acc = tl.where(mask_v, acc, -float("inf"))
+
+    local_max_val = tl.max(acc, axis=0)
+    local_max_idx = tl.argmax(acc, axis=0)
+    global_max_idx = pid_v * BLOCK_V + local_max_idx
+
+    out_val_offs = pid_b * stride_outv_b + pid_v * stride_outv_n
+    out_idx_offs = pid_b * stride_outi_b + pid_v * stride_outi_n
+    tl.store(out_val_ptr + out_val_offs, local_max_val)
+    tl.store(out_idx_ptr + out_idx_offs, global_max_idx)
+
+
+@triton.jit
 def _v5_fused_silu_fc2_argmax_kernel(
     z_ptr, s_ptr,
     fc2_ptr, base_ptr, fc2_bias_ptr,
@@ -135,15 +236,106 @@ def _v5_reduce_argmax_kernel(
     tl.store(final_token_ptr + pid_b * stride_final_b, best_idx)
 
 
+
+@triton.jit
+def _v5_fused_silu_fc2_candidate_argmax_kernel(
+    z_ptr, s_ptr,
+    fc2_ptr, base_ptr, fc2_bias_ptr, cand_ptr,
+    out_val_ptr, out_idx_ptr,
+    M, V, C,
+    stride_z_b, stride_z_m,
+    stride_s_b, stride_s_m,
+    stride_f2_v, stride_f2_m,
+    stride_base_b, stride_base_v,
+    stride_cand_b, stride_cand_c,
+    stride_outv_b, stride_outv_n,
+    stride_outi_b, stride_outi_n,
+    BLOCK_C: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_FC2_BIAS: tl.constexpr,
+):
+    pid_c = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+    cand_idx = tl.load(
+        cand_ptr + pid_b * stride_cand_b + offs_c * stride_cand_c,
+        mask=mask_c, other=0,
+    )
+    cand_valid = mask_c & (cand_idx >= 0) & (cand_idx < V)
+
+    acc = tl.zeros([BLOCK_C], dtype=tl.float32)
+
+    for m_start in range(0, M, BLOCK_M):
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+
+        z_block = tl.load(
+            z_ptr + pid_b * stride_z_b + offs_m * stride_z_m,
+            mask=mask_m, other=0.0,
+        ).to(tl.float32)
+        s_block = tl.load(
+            s_ptr + pid_b * stride_s_b + offs_m * stride_s_m,
+            mask=mask_m, other=0.0,
+        ).to(tl.float32)
+        preact = z_block + s_block
+        mid_block = preact * tl.sigmoid(preact)
+
+        fc2_ptrs = (
+            fc2_ptr
+            + cand_idx[:, None] * stride_f2_v
+            + offs_m[None, :] * stride_f2_m
+        )
+        fc2_block = tl.load(
+            fc2_ptrs,
+            mask=cand_valid[:, None] & mask_m[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+
+        acc += tl.sum(fc2_block * mid_block[None, :], axis=1)
+
+    if HAS_FC2_BIAS:
+        bias_block = tl.load(
+            fc2_bias_ptr + cand_idx, mask=cand_valid, other=0.0
+        ).to(tl.float32)
+        acc += bias_block
+
+    base_block = tl.load(
+        base_ptr + pid_b * stride_base_b + cand_idx * stride_base_v,
+        mask=cand_valid, other=-float("inf"),
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    acc += base_block
+
+    acc = tl.where(cand_valid, acc, -float("inf"))
+
+    local_max_val = tl.max(acc, axis=0)
+    local_max_pos = tl.argmax(acc, axis=0)
+    local_max_idx = tl.load(
+        cand_ptr
+        + pid_b * stride_cand_b
+        + (pid_c * BLOCK_C + local_max_pos) * stride_cand_c
+    )
+
+    out_val_offs = pid_b * stride_outv_b + pid_c * stride_outv_n
+    out_idx_offs = pid_b * stride_outi_b + pid_c * stride_outi_n
+    tl.store(out_val_ptr + out_val_offs, local_max_val)
+    tl.store(out_idx_ptr + out_idx_offs, local_max_idx)
+
+
 @triton.jit
 def _v5_fused_gru_cell_kernel(
-    gi_ptr, gh_ptr, h_ptr, h_out_ptr,
+    gi_ptr, gh_ptr, gh_bias_ptr, h_ptr, h_out_ptr,
     G,
     stride_gi_b, stride_gi_g,
     stride_gh_b, stride_gh_g,
+    stride_gh_bias_g,
     stride_h_b, stride_h_g,
     stride_hout_b, stride_hout_g,
     BLOCK_G: tl.constexpr,
+    HAS_GH_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -182,6 +374,29 @@ def _v5_fused_gru_cell_kernel(
         mask=mask_g, other=0.0,
     ).to(tl.float32)
 
+    if HAS_GH_BIAS:
+        gh_r = (
+            gh_r
+            + tl.load(
+                gh_bias_ptr + offs_g * stride_gh_bias_g,
+                mask=mask_g, other=0.0,
+            ).to(tl.float32)
+        ).to(gh_ptr.dtype.element_ty).to(tl.float32)
+        gh_z = (
+            gh_z
+            + tl.load(
+                gh_bias_ptr + (G + offs_g) * stride_gh_bias_g,
+                mask=mask_g, other=0.0,
+            ).to(tl.float32)
+        ).to(gh_ptr.dtype.element_ty).to(tl.float32)
+        gh_n = (
+            gh_n
+            + tl.load(
+                gh_bias_ptr + (2 * G + offs_g) * stride_gh_bias_g,
+                mask=mask_g, other=0.0,
+            ).to(tl.float32)
+        ).to(gh_ptr.dtype.element_ty).to(tl.float32)
+
     r = tl.sigmoid(gi_r + gh_r)
     z = tl.sigmoid(gi_z + gh_z)
     # tanh(x) = 2 * sigmoid(2x) - 1 (Triton 2.x lacks tl.tanh)
@@ -193,6 +408,81 @@ def _v5_fused_gru_cell_kernel(
         h_new.to(h_ptr.dtype.element_ty),
         mask=mask_g,
     )
+
+
+def compute_silu_sum(
+    *,
+    z_proj: torch.Tensor,     # [B, M]
+    s_proj: torch.Tensor,     # [B, M]
+    mid_out: torch.Tensor,    # [B, M]
+    block_m: int = 256,
+) -> None:
+    B, M = z_proj.shape
+    _v5_silu_sum_kernel[(B,)](
+        z_proj, s_proj, mid_out,
+        M,
+        z_proj.stride(0), z_proj.stride(1),
+        s_proj.stride(0), s_proj.stride(1),
+        mid_out.stride(0), mid_out.stride(1),
+        BLOCK_M=triton.next_power_of_2(M) if M <= block_m else block_m,
+        num_warps=1,
+    )
+
+
+def fused_mid_fc2_argmax(
+    *,
+    mid_proj: torch.Tensor,      # [B, M]
+    fc2_weight: torch.Tensor,    # [V, M]
+    fc2_bias: torch.Tensor | None,  # [V] or None
+    base_logits: torch.Tensor,   # [B, V]
+    out_val: torch.Tensor,       # [B, num_v_blocks] fp32 scratch
+    out_idx: torch.Tensor,       # [B, num_v_blocks] int32 scratch
+    final_token: torch.Tensor,   # [B] int64 destination
+    block_v: int = 512,
+    block_m: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
+    _profile_events: list | None = None,
+) -> None:
+    B, M = mid_proj.shape
+    V = base_logits.shape[1]
+    num_v_blocks = (V + block_v - 1) // block_v
+    has_fc2_bias = fc2_bias is not None
+    fc2_bias_arg = fc2_bias if has_fc2_bias else out_val  # placeholder ptr
+
+    grid_main = (num_v_blocks, B)
+    _v5_fused_mid_fc2_argmax_kernel[grid_main](
+        mid_proj,
+        fc2_weight, base_logits, fc2_bias_arg,
+        out_val, out_idx,
+        M, V,
+        mid_proj.stride(0), mid_proj.stride(1),
+        fc2_weight.stride(0), fc2_weight.stride(1),
+        base_logits.stride(0), base_logits.stride(1),
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        BLOCK_V=block_v,
+        BLOCK_M=block_m,
+        HAS_FC2_BIAS=has_fc2_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    if _profile_events is not None:
+        _profile_events[0] = torch.cuda.Event(enable_timing=True)
+        _profile_events[0].record()
+
+    _v5_reduce_argmax_kernel[(B,)](
+        out_val, out_idx, final_token,
+        num_v_blocks,
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        final_token.stride(0),
+        BLOCK_N=512,
+        num_warps=1,
+    )
+    if _profile_events is not None:
+        _profile_events[1] = torch.cuda.Event(enable_timing=True)
+        _profile_events[1].record()
 
 
 def fused_silu_fc2_argmax(
@@ -207,10 +497,15 @@ def fused_silu_fc2_argmax(
     final_token: torch.Tensor,   # [B] int64 destination
     block_v: int = 512,
     block_m: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
+    _profile_events: list | None = None,
 ) -> None:
     """Single-step fused: SiLU(z+s) @ fc2.T + bias + base_logits -> argmax.
 
     Writes the per-batch global argmax into ``final_token`` in-place.
+    If ``_profile_events`` is a list of length 2, records CUDA events at
+    [0] (after main kernel) and [1] (after reduce kernel) for micro-profiling.
     """
     B, M = z_proj.shape
     V = base_logits.shape[1]
@@ -233,7 +528,12 @@ def fused_silu_fc2_argmax(
         BLOCK_V=block_v,
         BLOCK_M=block_m,
         HAS_FC2_BIAS=has_fc2_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
+    if _profile_events is not None:
+        _profile_events[0] = torch.cuda.Event(enable_timing=True)
+        _profile_events[0].record()
 
     _v5_reduce_argmax_kernel[(B,)](
         out_val, out_idx, final_token,
@@ -242,40 +542,119 @@ def fused_silu_fc2_argmax(
         out_idx.stride(0), out_idx.stride(1),
         final_token.stride(0),
         BLOCK_N=512,
+        num_warps=1,
     )
+    if _profile_events is not None:
+        _profile_events[1] = torch.cuda.Event(enable_timing=True)
+        _profile_events[1].record()
+
+
+
+def fused_silu_fc2_candidate_argmax(
+    *,
+    z_proj: torch.Tensor,        # [B, M]
+    s_proj: torch.Tensor,        # [B, M]
+    fc2_weight: torch.Tensor,    # [V, M]
+    fc2_bias: torch.Tensor | None,  # [V] or None
+    base_logits: torch.Tensor,   # [B, V]
+    candidate_ids: torch.Tensor, # [B, C] local vocab ids into fc2/base_logits
+    out_val: torch.Tensor,       # [B, num_candidate_blocks] fp32 scratch
+    out_idx: torch.Tensor,       # [B, num_candidate_blocks] int32 scratch
+    final_token: torch.Tensor,   # [B] int64 destination, local vocab ids
+    block_c: int = 512,
+    block_m: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
+    _profile_events: list | None = None,
+) -> None:
+    """Candidate-restricted v5 scoring over a shared per-block token pool.
+
+    ``candidate_ids`` contains local vocab ids for the current TP shard. The
+    output token ids are local ids, matching ``fused_silu_fc2_argmax`` semantics.
+    """
+    B, M = z_proj.shape
+    V = base_logits.shape[1]
+    C = candidate_ids.shape[1]
+    num_c_blocks = (C + block_c - 1) // block_c
+    has_fc2_bias = fc2_bias is not None
+    fc2_bias_arg = fc2_bias if has_fc2_bias else out_val  # placeholder ptr
+
+    grid_main = (num_c_blocks, B)
+    _v5_fused_silu_fc2_candidate_argmax_kernel[grid_main](
+        z_proj, s_proj,
+        fc2_weight, base_logits, fc2_bias_arg, candidate_ids,
+        out_val, out_idx,
+        M, V, C,
+        z_proj.stride(0), z_proj.stride(1),
+        s_proj.stride(0), s_proj.stride(1),
+        fc2_weight.stride(0), fc2_weight.stride(1),
+        base_logits.stride(0), base_logits.stride(1),
+        candidate_ids.stride(0), candidate_ids.stride(1),
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        BLOCK_C=block_c,
+        BLOCK_M=block_m,
+        HAS_FC2_BIAS=has_fc2_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    if _profile_events is not None:
+        _profile_events[0] = torch.cuda.Event(enable_timing=True)
+        _profile_events[0].record()
+
+    _v5_reduce_argmax_kernel[(B,)](
+        out_val, out_idx, final_token,
+        num_c_blocks,
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        final_token.stride(0),
+        BLOCK_N=512,
+        num_warps=1,
+    )
+    if _profile_events is not None:
+        _profile_events[1] = torch.cuda.Event(enable_timing=True)
+        _profile_events[1].record()
 
 
 def fused_gru_cell(
     *,
     gi: torch.Tensor,        # [B, 3*G]
     gh: torch.Tensor,        # [B, 3*G]
+    gh_bias: torch.Tensor | None = None,  # [3*G] or None
     h_state: torch.Tensor,   # [B, G]
     h_out: torch.Tensor,     # [B, G] destination
     block_g: int = 256,
 ) -> None:
     B, G3 = gi.shape
     G = h_state.shape[1]
+    has_gh_bias = gh_bias is not None
+    gh_bias_arg = gh_bias if has_gh_bias else gh  # placeholder ptr
+    gh_bias_stride = gh_bias_arg.stride(0) if has_gh_bias else 0
     grid = (B, (G + block_g - 1) // block_g)
     _v5_fused_gru_cell_kernel[grid](
-        gi, gh, h_state, h_out,
+        gi, gh, gh_bias_arg, h_state, h_out,
         G,
         gi.stride(0), gi.stride(1),
         gh.stride(0), gh.stride(1),
+        gh_bias_stride,
         h_state.stride(0), h_state.stride(1),
         h_out.stride(0), h_out.stride(1),
         BLOCK_G=block_g,
+        HAS_GH_BIAS=has_gh_bias,
     )
 
 
 @triton.jit
 def _v5_fused_gru_cell_from_table_kernel(
-    tok_ptr, table_ptr, gh_ptr, h_ptr, h_out_ptr,
+    tok_ptr, table_ptr, gh_ptr, gh_bias_ptr, h_ptr, h_out_ptr,
     G, V,
     stride_table_v, stride_table_g,
     stride_gh_b, stride_gh_g,
+    stride_gh_bias_g,
     stride_h_b, stride_h_g,
     stride_hout_b, stride_hout_g,
     BLOCK_G: tl.constexpr,
+    HAS_GH_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -320,6 +699,29 @@ def _v5_fused_gru_cell_from_table_kernel(
         mask=mask_g, other=0.0,
     ).to(tl.float32)
 
+    if HAS_GH_BIAS:
+        gh_r = (
+            gh_r
+            + tl.load(
+                gh_bias_ptr + offs_g * stride_gh_bias_g,
+                mask=mask_g, other=0.0,
+            ).to(tl.float32)
+        ).to(gh_ptr.dtype.element_ty).to(tl.float32)
+        gh_z = (
+            gh_z
+            + tl.load(
+                gh_bias_ptr + (G + offs_g) * stride_gh_bias_g,
+                mask=mask_g, other=0.0,
+            ).to(tl.float32)
+        ).to(gh_ptr.dtype.element_ty).to(tl.float32)
+        gh_n = (
+            gh_n
+            + tl.load(
+                gh_bias_ptr + (2 * G + offs_g) * stride_gh_bias_g,
+                mask=mask_g, other=0.0,
+            ).to(tl.float32)
+        ).to(gh_ptr.dtype.element_ty).to(tl.float32)
+
     r = tl.sigmoid(gi_r + gh_r)
     z = tl.sigmoid(gi_z + gh_z)
     n = 2.0 * tl.sigmoid(2.0 * (gi_n + r * gh_n)) - 1.0
@@ -337,6 +739,7 @@ def fused_gru_cell_from_table(
     tok_full: torch.Tensor,       # [B] int64 token ids (already shifted by org_vocab_start)
     gru_input_table: torch.Tensor,  # [V, 3*G] precomputed embed @ W_ih.T + b_ih
     gh: torch.Tensor,             # [B, 3*G] h_state @ W_hh.T (+ b_hh)
+    gh_bias: torch.Tensor | None = None,  # [3*G] or None
     h_state: torch.Tensor,        # [B, G]
     h_out: torch.Tensor,          # [B, G] destination
     block_g: int = 256,
@@ -349,13 +752,18 @@ def fused_gru_cell_from_table(
     B = tok_full.shape[0]
     G = h_state.shape[1]
     V = gru_input_table.shape[0]
+    has_gh_bias = gh_bias is not None
+    gh_bias_arg = gh_bias if has_gh_bias else gh  # placeholder ptr
+    gh_bias_stride = gh_bias_arg.stride(0) if has_gh_bias else 0
     grid = (B, (G + block_g - 1) // block_g)
     _v5_fused_gru_cell_from_table_kernel[grid](
-        tok_full, gru_input_table, gh, h_state, h_out,
+        tok_full, gru_input_table, gh, gh_bias_arg, h_state, h_out,
         G, V,
         gru_input_table.stride(0), gru_input_table.stride(1),
         gh.stride(0), gh.stride(1),
+        gh_bias_stride,
         h_state.stride(0), h_state.stride(1),
         h_out.stride(0), h_out.stride(1),
         BLOCK_G=block_g,
+        HAS_GH_BIAS=has_gh_bias,
     )

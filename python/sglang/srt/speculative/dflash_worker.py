@@ -30,9 +30,12 @@ from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_verify_mask_policy,
 )
 from sglang.srt.speculative.dflash_v5_kernels import (
+    compute_silu_sum,
     fused_gru_cell,
     fused_gru_cell_from_table,
+    fused_mid_fc2_argmax,
     fused_silu_fc2_argmax,
+    fused_silu_fc2_candidate_argmax,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -891,6 +894,81 @@ class DFlashWorker:
 
         return out_token_ids
 
+    def _accumulate_and_print_breakdown(self, breakdown: dict) -> None:
+        """Accumulate per-step loop timings and print summary every N calls."""
+        acc = getattr(self, "_v5_breakdown_acc", None)
+        if acc is None:
+            acc = {
+                "n": 0,
+                "print_every": 10,
+                "gemm": [0.0] * len(breakdown["gemm"]),
+                "score": [0.0] * len(breakdown["score"]),
+                "score_main": [0.0] * len(breakdown.get("score_main", [])),
+                "score_reduce": [0.0] * len(breakdown.get("score_reduce", [])),
+                "gru": [0.0] * len(breakdown["gru"]),
+                "misc": [0.0] * len(breakdown["misc"]),
+            }
+            self._v5_breakdown_acc = acc
+        acc["n"] += 1
+        for k in range(len(breakdown["gemm"])):
+            acc["gemm"][k] += breakdown["gemm"][k]
+            acc["score"][k] += breakdown["score"][k]
+            acc["gru"][k] += breakdown["gru"][k]
+            acc["misc"][k] += breakdown["misc"][k]
+            if k < len(breakdown.get("score_main", [])):
+                acc["score_main"][k] += breakdown["score_main"][k]
+                acc["score_reduce"][k] += breakdown["score_reduce"][k]
+        if acc["n"] % acc["print_every"] == 0:
+            n = acc["n"]
+            lines = ["[DFLASH v5 loop breakdown] per-step avg (ms) over %d calls:" % n]
+            has_subscore = len(acc["score_main"]) > 0
+            if has_subscore:
+                header = "  k | proj_gemm | score(main+reduce) | gru_update | misc | step_total"
+            else:
+                header = "  k | proj_gemm | score_argmax | gru_update | misc | step_total"
+            lines.append(header)
+            total_gemm = 0.0
+            total_score = 0.0
+            total_gru = 0.0
+            total_misc = 0.0
+            total_score_main = 0.0
+            total_score_reduce = 0.0
+            for k in range(1, len(acc["gemm"])):
+                g = acc["gemm"][k] / n
+                s = acc["score"][k] / n
+                r = acc["gru"][k] / n
+                m = acc["misc"][k] / n
+                t = g + s + r + m
+                if has_subscore:
+                    sm = acc["score_main"][k] / n
+                    sr = acc["score_reduce"][k] / n
+                    lines.append(
+                        f"  {k:2d} | {g:9.4f} | {s:6.4f}({sm:5.4f}+{sr:5.4f}) | {r:10.4f} | {m:4.4f} | {t:10.4f}"
+                    )
+                    total_score_main += sm
+                    total_score_reduce += sr
+                else:
+                    lines.append(
+                        f"  {k:2d} | {g:9.4f} | {s:12.4f} | {r:10.4f} | {m:4.4f} | {t:10.4f}"
+                    )
+                total_gemm += g
+                total_score += s
+                total_gru += r
+                total_misc += m
+            if has_subscore:
+                lines.append(
+                    f"  14-step sum | proj_gemm={total_gemm:.4f} "
+                    f"score={total_score:.4f}(main={total_score_main:.4f}+reduce={total_score_reduce:.4f}) "
+                    f"gru={total_gru:.4f} misc={total_misc:.4f} "
+                    f"total={total_gemm+total_score+total_gru+total_misc:.4f}"
+                )
+            else:
+                lines.append(
+                    f"  14-step sum | proj_gemm={total_gemm:.4f} score={total_score:.4f} "
+                    f"gru={total_gru:.4f} misc={total_misc:.4f} total={total_gemm+total_score+total_gru+total_misc:.4f}"
+                )
+            logger.warning("\n".join(lines))
+
     def _get_or_capture_v5_loop_graph(
         self,
         *,
@@ -907,6 +985,7 @@ class DFlashWorker:
         gru_input_table: torch.Tensor,
         hidden_size: int,
         lm_head_weight: torch.Tensor,
+        candidate_pool_size: int = 0,
     ):
         """Capture (or return cached) CUDA graph for the 13-iteration v5 rollout loop.
 
@@ -927,7 +1006,20 @@ class DFlashWorker:
             self._v5_loop_graph_pool = pool
         use_fused = os.environ.get("DFLASH_V5_FUSED") == "1"
         use_table_fused = os.environ.get("DFLASH_V5_GRU_TABLE_FUSED", "1") == "1"
+        use_gru_bias_fused = os.environ.get("DFLASH_V5_GRU_BIAS_FUSED", "1") == "1"
+        use_precompute_mid = os.environ.get("DFLASH_V5_PRECOMPUTE_MID") == "1"
         use_full_graph = os.environ.get("DFLASH_V5_FULL_GRAPH") == "1"
+        candidate_pool_size = max(0, int(candidate_pool_size))
+        use_candidate_pool = use_fused and candidate_pool_size > 0
+        if use_candidate_pool:
+            # Candidate pool needs base_logits topk from the eager prologue. Keep
+            # this path separate from the broader full-graph experiment.
+            use_full_graph = False
+            use_precompute_mid = False
+        disable_loop_graph = os.environ.get("DFLASH_V5_DISABLE_LOOP_GRAPH") == "1"
+        breakdown_enabled = os.environ.get("DFLASH_V5_LOOP_BREAKDOWN") == "1"
+        ablate_no_gru = os.environ.get("DFLASH_V5_ABLATE_NO_GRU") == "1"
+        ablate_no_score = os.environ.get("DFLASH_V5_ABLATE_NO_SCORE") == "1"
         # CUDA graph baked-in pointers must outlive the entry; the cache key
         # therefore includes every shape/dtype/branch toggle that changes the
         # captured node set. (bs alone would alias different num_draft / dtype
@@ -943,8 +1035,13 @@ class DFlashWorker:
             logits_dtype,
             use_fused,
             use_table_fused,
+            use_gru_bias_fused,
+            use_precompute_mid,
             use_full_graph,
+            use_candidate_pool,
+            candidate_pool_size,
             hidden_size,
+            disable_loop_graph,
         )
         entry = pool.get(pool_key)
         if entry is not None:
@@ -965,7 +1062,14 @@ class DFlashWorker:
         if use_fused:
             block_v = int(os.environ.get("DFLASH_V5_BLOCK_V", "512"))
             block_m = int(os.environ.get("DFLASH_V5_BLOCK_M", "32"))
+            score_num_warps = int(os.environ.get("DFLASH_V5_SCORE_NUM_WARPS", "4"))
+            score_num_stages = int(os.environ.get("DFLASH_V5_SCORE_NUM_STAGES", "3"))
+            candidate_block_c = int(os.environ.get("DFLASH_V5_CANDIDATE_BLOCK_C", "512"))
             num_v_blocks_shard = (num_org + block_v - 1) // block_v
+            num_score_blocks = (
+                (candidate_pool_size + candidate_block_c - 1) // candidate_block_c
+                if use_candidate_pool else num_v_blocks_shard
+            )
             # DFLASH_V5_GRU_TABLE_FUSED=1 (default) inlines index_select into the
             # GRU cell kernel; "0" falls back to the original index_select + fused_gru_cell.
             w_s_T = state["w_s"].T.contiguous()
@@ -979,13 +1083,23 @@ class DFlashWorker:
             )
             s_proj_buf = sh_buf[:, :emb_dim]
             gh_buf = sh_buf[:, emb_dim:]
+            mid_buf = (
+                torch.empty((bs, emb_dim), dtype=z_dtype, device=device)
+                if use_precompute_mid else None
+            )
             h_new_buf = torch.empty((bs, G), dtype=z_dtype, device=device)
             argmax_val_buf = torch.empty(
-                (bs, num_v_blocks_shard), dtype=torch.float32, device=device,
+                (bs, num_score_blocks), dtype=torch.float32, device=device,
             )
             argmax_idx_buf = torch.empty(
-                (bs, num_v_blocks_shard), dtype=torch.int32, device=device,
+                (bs, num_score_blocks), dtype=torch.int32, device=device,
             )
+            candidate_ids_buf = (
+                torch.empty((bs, candidate_pool_size), dtype=torch.long, device=device)
+                if use_candidate_pool else None
+            )
+            if candidate_ids_buf is not None:
+                candidate_ids_buf.zero_()
             local_tok_buf = torch.empty((bs,), dtype=torch.long, device=device)
             gi_buf = (
                 None if use_table_fused
@@ -1014,52 +1128,147 @@ class DFlashWorker:
                 fc2_w_shard, w_sh_T,
                 gru_input_table,
             ]
+            if mid_buf is not None:
+                static_refs.append(mid_buf)
             if fc2_b_shard is not None:
                 static_refs.append(fc2_b_shard)
             if b_hh_static is not None:
                 static_refs.append(b_hh_static)
+            if candidate_ids_buf is not None:
+                static_refs.append(candidate_ids_buf)
             if gi_buf is not None:
                 static_refs.append(gi_buf)
 
             def run_loop(out_target):
                 h_state = gru_h_buf
+                breakdown = None
+                if breakdown_enabled:
+                    breakdown = {
+                        "gemm": [0.0] * num_draft,
+                        "score": [0.0] * num_draft,
+                        "score_main": [0.0] * num_draft,
+                        "score_reduce": [0.0] * num_draft,
+                        "gru": [0.0] * num_draft,
+                        "misc": [0.0] * num_draft,
+                    }
+                    ev = [
+                        [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+                        for _ in range(num_draft)
+                    ]
                 for k in range(1, num_draft):
-                    # Single GEMM produces both s_proj (emb_dim) and gh (3*G);
-                    # views s_proj_buf / gh_buf alias slices of sh_buf.
+                    if breakdown_enabled:
+                        ev[k][0].record()
                     torch.matmul(h_state, w_sh_T, out=sh_buf)
-                    fused_silu_fc2_argmax(
-                        z_proj=z_proj_buf[:, k, :],
-                        s_proj=s_proj_buf,
-                        fc2_weight=fc2_w_shard,
-                        fc2_bias=fc2_b_shard,
-                        base_logits=base_logits_buf[:, k, :],
-                        out_val=argmax_val_buf,
-                        out_idx=argmax_idx_buf,
-                        final_token=local_tok_buf,
-                        block_v=block_v,
-                        block_m=block_m,
-                    )
-                    tok_full = local_tok_buf + org_vocab_start
-                    out_target[:, k] = tok_full
-                    if k + 1 < num_draft:
-                        if b_hh_static is not None:
-                            gh_buf.add_(b_hh_static)
-                        if use_table_fused:
-                            fused_gru_cell_from_table(
-                                tok_full=tok_full,
-                                gru_input_table=gru_input_table,
-                                gh=gh_buf,
-                                h_state=h_state, h_out=h_new_buf,
+                    if breakdown_enabled:
+                        ev[k][1].record()
+                    if not ablate_no_score:
+                        score_ev = None
+                        if breakdown_enabled:
+                            score_ev = [None, None]
+                        if use_candidate_pool:
+                            assert candidate_ids_buf is not None
+                            fused_silu_fc2_candidate_argmax(
+                                z_proj=z_proj_buf[:, k, :],
+                                s_proj=s_proj_buf,
+                                fc2_weight=fc2_w_shard,
+                                fc2_bias=fc2_b_shard,
+                                base_logits=base_logits_buf[:, k, :],
+                                candidate_ids=candidate_ids_buf,
+                                out_val=argmax_val_buf,
+                                out_idx=argmax_idx_buf,
+                                final_token=local_tok_buf,
+                                block_c=candidate_block_c,
+                                block_m=block_m,
+                                num_warps=score_num_warps,
+                                num_stages=score_num_stages,
+                                _profile_events=score_ev,
+                            )
+                        elif use_precompute_mid:
+                            assert mid_buf is not None
+                            compute_silu_sum(
+                                z_proj=z_proj_buf[:, k, :],
+                                s_proj=s_proj_buf,
+                                mid_out=mid_buf,
+                            )
+                            fused_mid_fc2_argmax(
+                                mid_proj=mid_buf,
+                                fc2_weight=fc2_w_shard,
+                                fc2_bias=fc2_b_shard,
+                                base_logits=base_logits_buf[:, k, :],
+                                out_val=argmax_val_buf,
+                                out_idx=argmax_idx_buf,
+                                final_token=local_tok_buf,
+                                block_v=block_v,
+                                block_m=block_m,
+                                num_warps=score_num_warps,
+                                num_stages=score_num_stages,
+                                _profile_events=score_ev,
                             )
                         else:
-                            torch.index_select(
-                                gru_input_table, 0, tok_full, out=gi_buf
+                            fused_silu_fc2_argmax(
+                                z_proj=z_proj_buf[:, k, :],
+                                s_proj=s_proj_buf,
+                                fc2_weight=fc2_w_shard,
+                                fc2_bias=fc2_b_shard,
+                                base_logits=base_logits_buf[:, k, :],
+                                out_val=argmax_val_buf,
+                                out_idx=argmax_idx_buf,
+                                final_token=local_tok_buf,
+                                block_v=block_v,
+                                block_m=block_m,
+                                num_warps=score_num_warps,
+                                num_stages=score_num_stages,
+                                _profile_events=score_ev,
                             )
-                            fused_gru_cell(
-                                gi=gi_buf, gh=gh_buf,
-                                h_state=h_state, h_out=h_new_buf,
+                        if breakdown_enabled and score_ev is not None:
+                            # score_ev[0] recorded after main, score_ev[1] after reduce
+                            breakdown["score_main"][k] = ev[k][1].elapsed_time(
+                                score_ev[0]
                             )
-                        h_state = h_new_buf
+                            breakdown["score_reduce"][k] = score_ev[0].elapsed_time(
+                                score_ev[1]
+                            )
+                    else:
+                        local_tok_buf.fill_(0)
+                    if breakdown_enabled:
+                        ev[k][2].record()
+                    tok_full = local_tok_buf + org_vocab_start
+                    out_target[:, k] = tok_full
+                    if breakdown_enabled:
+                        ev[k][3].record()
+                    if k + 1 < num_draft:
+                        if not ablate_no_gru:
+                            gh_bias = b_hh_static
+                            if b_hh_static is not None and not use_gru_bias_fused:
+                                gh_buf.add_(b_hh_static)
+                                gh_bias = None
+                            if use_table_fused:
+                                fused_gru_cell_from_table(
+                                    tok_full=tok_full,
+                                    gru_input_table=gru_input_table,
+                                    gh=gh_buf,
+                                    gh_bias=gh_bias,
+                                    h_state=h_state, h_out=h_new_buf,
+                                )
+                            else:
+                                torch.index_select(
+                                    gru_input_table, 0, tok_full, out=gi_buf
+                                )
+                                fused_gru_cell(
+                                    gi=gi_buf, gh=gh_buf, gh_bias=gh_bias,
+                                    h_state=h_state, h_out=h_new_buf,
+                                )
+                            h_state = h_new_buf
+                    if breakdown_enabled:
+                        ev[k][4].record()
+                if breakdown_enabled:
+                    torch.cuda.synchronize()
+                    for k in range(1, num_draft):
+                        breakdown["gemm"][k] = ev[k][0].elapsed_time(ev[k][1])
+                        breakdown["score"][k] = ev[k][1].elapsed_time(ev[k][2])
+                        breakdown["misc"][k] = ev[k][2].elapsed_time(ev[k][3])
+                        breakdown["gru"][k] = ev[k][3].elapsed_time(ev[k][4])
+                return breakdown
         else:
             # Pure cuBLAS+elementwise version (verified to work).
             # Optimization: replace per-step `embed_module(tok)` + `F.linear(W_ih)`
@@ -1175,6 +1384,27 @@ class DFlashWorker:
             full_static_refs = static_refs
             run_full = run_loop  # kept for symmetry; outer code branches on use_full_graph
 
+        if disable_loop_graph:
+            entry = {
+                "z_proj_buf": z_proj_buf,
+                "base_logits_buf": base_logits_buf,
+                "gru_h_buf": gru_h_buf,
+                "out_buf": out_buf,
+                "run_full": run_full,
+                "_static_refs": full_static_refs,
+            }
+            if use_full_graph:
+                entry["z_buf"] = z_buf
+                entry["verified_id_buf"] = verified_id_buf
+            if use_candidate_pool:
+                entry["candidate_ids_buf"] = candidate_ids_buf
+            pool[pool_key] = entry
+            logger.warning(
+                "[DFLASH v5] eager loop path (no graph) for bs=%d num_draft=%d",
+                bs, num_draft,
+            )
+            return entry
+
         # Warmup outside graph.
         warmup_out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
         for _ in range(2):
@@ -1200,10 +1430,15 @@ class DFlashWorker:
         if use_full_graph:
             entry["z_buf"] = z_buf
             entry["verified_id_buf"] = verified_id_buf
+        if use_candidate_pool:
+            entry["candidate_ids_buf"] = candidate_ids_buf
         pool[pool_key] = entry
         logger.warning(
             "[DFLASH v5] captured CUDA graph (%s) for v5 rollout loop bs=%d num_draft=%d",
-            "Triton-fused" if use_fused else "cuBLAS",
+            (
+                "Triton-candidate-pool"
+                if use_candidate_pool else ("Triton-fused" if use_fused else "cuBLAS")
+            ),
             bs, num_draft,
         )
         return entry
@@ -1274,6 +1509,28 @@ class DFlashWorker:
         num_org = int(shard.num_org_elements)
         if num_org <= 0:
             raise RuntimeError("DFLASH lm_head has empty base vocab shard.")
+
+        candidate_pool_size = max(
+            0, int(os.environ.get("DFLASH_V5_CANDIDATE_POOL", "0"))
+        )
+        if candidate_pool_size > 0:
+            if os.environ.get("DFLASH_V5_FUSED") != "1":
+                if not getattr(self, "_v5_candidate_requires_fused_warned", False):
+                    logger.warning(
+                        "DFLASH_V5_CANDIDATE_POOL requires DFLASH_V5_FUSED=1; "
+                        "ignoring candidate pool."
+                    )
+                    self._v5_candidate_requires_fused_warned = True
+                candidate_pool_size = 0
+            elif candidate_pool_size >= num_org:
+                if not getattr(self, "_v5_candidate_full_vocab_warned", False):
+                    logger.warning(
+                        "DFLASH_V5_CANDIDATE_POOL=%d is >= local vocab size %d; "
+                        "using full-vocab v5 scoring instead.",
+                        candidate_pool_size, num_org,
+                    )
+                    self._v5_candidate_full_vocab_warned = True
+                candidate_pool_size = 0
 
         draft_model = self.draft_model
         embed_module = target_model.get_input_embeddings()
@@ -1359,6 +1616,14 @@ class DFlashWorker:
         )
 
         use_full_graph = os.environ.get("DFLASH_V5_FULL_GRAPH") == "1"
+        if candidate_pool_size > 0 and use_full_graph:
+            if not getattr(self, "_v5_candidate_full_graph_warned", False):
+                logger.warning(
+                    "DFLASH_V5_CANDIDATE_POOL is enabled; disabling "
+                    "DFLASH_V5_FULL_GRAPH for this v5 rollout path."
+                )
+                self._v5_candidate_full_graph_warned = True
+            use_full_graph = False
 
         if not use_full_graph:
             # Original eager-prologue path.
@@ -1369,6 +1634,17 @@ class DFlashWorker:
             if prof_enabled:
                 prof["evt_base_end"].record()
                 prof["evt_init_start"].record()
+
+            candidate_ids = None
+            if candidate_pool_size > 0:
+                pool_source = (
+                    base_logits[:, 1:, :]
+                    if int(base_logits.shape[1]) > 1 else base_logits[:, :1, :]
+                )
+                pool_logits = pool_source.max(dim=1).values
+                candidate_ids = torch.topk(
+                    pool_logits, k=candidate_pool_size, dim=-1
+                ).indices.contiguous()
 
             slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
             slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
@@ -1429,15 +1705,24 @@ class DFlashWorker:
                 gru_input_table=gru_input_table,
                 hidden_size=hidden_size,
                 lm_head_weight=weight,
+                candidate_pool_size=candidate_pool_size,
             )
             graph_entry["z_proj_buf"].copy_(z_proj_all)
             graph_entry["base_logits_buf"].copy_(base_logits)
+            if candidate_ids is not None:
+                graph_entry["candidate_ids_buf"].copy_(candidate_ids)
             graph_entry["gru_h_buf"].copy_(gru_h)
             graph_entry["out_buf"][:, 0].copy_(slot_1)
-            graph_entry["graph"].replay()
-            out = graph_entry["out_buf"]
+            if graph_entry.get("graph") is not None:
+                graph_entry["graph"].replay()
+                out = graph_entry["out_buf"]
+            else:
+                breakdown = graph_entry["run_full"](graph_entry["out_buf"])
+                out = graph_entry["out_buf"]
+                if breakdown is not None:
+                    self._accumulate_and_print_breakdown(breakdown)
 
-            if check_init:
+            if check_init and graph_entry.get("graph") is not None:
                 out_ref = out.clone()
                 graph_entry["gru_h_buf"].copy_(gru_h_fast)
                 graph_entry["graph"].replay()
@@ -1479,11 +1764,18 @@ class DFlashWorker:
                 gru_input_table=gru_input_table,
                 hidden_size=hidden_size,
                 lm_head_weight=weight,
+                candidate_pool_size=0,
             )
             graph_entry["z_buf"].copy_(z_for_dtype)
             graph_entry["verified_id_buf"].copy_(verified_id.to(torch.long))
-            graph_entry["graph"].replay()
-            out = graph_entry["out_buf"]
+            if graph_entry.get("graph") is not None:
+                graph_entry["graph"].replay()
+                out = graph_entry["out_buf"]
+            else:
+                breakdown = graph_entry["run_full"](graph_entry["out_buf"])
+                out = graph_entry["out_buf"]
+                if breakdown is not None:
+                    self._accumulate_and_print_breakdown(breakdown)
 
         if prof_enabled:
             prof["evt_loop_end"].record()
