@@ -15,3 +15,5 @@ qwen8B-Domino/
 *.bin
 
 .DS_Store
+
+set_sglang_cache_env.sh
