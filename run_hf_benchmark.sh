@@ -6,36 +6,22 @@ BENCHMARK_CODE_ROOT="${BENCHMARK_CODE_ROOT:-${SCRIPT_DIR}/code}"
 PYTHON="${PYTHON:-python}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3-8B}"
 DRAFT_MODEL="${DRAFT_MODEL:-}"
-TASKS="${TASKS:-gsm8k:4,math500:4}"
+TASKS="${TASKS:-gsm8k:128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
-NUM_GPUS="${NUM_GPUS:-1}"
+NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29601}"
 OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/outputs/hf_$(date +%Y%m%d_%H%M%S)}"
-
-fail() {
-  echo "ERROR: $*" >&2
-  exit 1
-}
-
-if [ -z "${DRAFT_MODEL}" ]; then
-  fail "DRAFT_MODEL is required. Example: DRAFT_MODEL=/path/to/qwen8B-Domino ./run_hf_benchmark.sh"
-fi
-if [ ! -d "${DRAFT_MODEL}" ]; then
-  fail "DRAFT_MODEL does not exist or is not a directory: ${DRAFT_MODEL}"
-fi
-if [ ! -f "${BENCHMARK_CODE_ROOT}/benchmark.py" ]; then
-  fail "BENCHMARK_CODE_ROOT must point to bundled benchmark code containing benchmark.py. Current: ${BENCHMARK_CODE_ROOT}"
-fi
-if [[ "${PYTHON}" == */* ]]; then
-  [ -x "${PYTHON}" ] || fail "PYTHON is not executable: ${PYTHON}"
-else
-  command -v "${PYTHON}" >/dev/null 2>&1 || fail "PYTHON not found on PATH: ${PYTHON}"
-fi
+HF_CACHE_DIR="${HF_CACHE_DIR:-${SCRIPT_DIR}/.cache/huggingface}"
 
 mkdir -p "${OUT_DIR}"
-cd "${BENCHMARK_CODE_ROOT}"
+
+export HF_HOME="${HF_CACHE_DIR}"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export TRANSFORMERS_CACHE="${HF_HUB_CACHE}"
+export HF_HUB_DISABLE_SYMLINKS_WARNING="${HF_HUB_DISABLE_SYMLINKS_WARNING:-1}"
+mkdir -p "${HF_HOME}" "${HF_HUB_CACHE}" "${TRANSFORMERS_CACHE}"
 
 IFS=',' read -r -a TASK_ARRAY <<< "${TASKS}"
 for task in "${TASK_ARRAY[@]}"; do

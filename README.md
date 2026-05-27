@@ -1,117 +1,83 @@
-# qwen8B-Domino Benchmark Release
+# Domino: Decoupling Causal Modeling from Autoregressive Drafting in Speculative Decoding
 
-`qwen8B-Domino` is a Domino/DFlash speculative draft checkpoint for `Qwen/Qwen3-8B`. It is not a standalone chat model: run it together with the Qwen3-8B target model and the bundled benchmark code in this directory.
+Domino accelerates large language model inference with speculative decoding. Standard autoregressive decoding is sequential and often memory-bound, leaving GPU parallelism underused. Existing autoregressive draft models improve draft quality by modeling dependencies between draft tokens, but they also introduce sequential drafting overhead.
 
-Checkpoint download:
+Domino keeps drafting block-parallel while adding a lightweight causal correction head. The parallel draft backbone proposes a full block at once, and the Domino head injects causal information from previously drafted tokens to refine the draft distributions. This preserves the low cost of parallel drafting while improving acceptance length and end-to-end speedup.
 
-<https://drive.google.com/drive/folders/1C3eOPxnXnyAnBWmJytp6f2-QWARbztOL?dmr=1&ec=wgc-drive-%5Bmodule%5D-goto>
+![Domino pipeline](asset/pipeline.png)
 
-## Package Contents
+## Supported Models
 
-- `code/`: bundled Domino benchmark client code.
-- `run_hf_benchmark.sh`: reviewer-facing HF launch script.
-- `run_sglang_benchmark.sh`: reviewer-facing SGLang launch script.
-- `requirements-hf.txt`: Python package requirements for the HF benchmark, excluding the CUDA-specific PyTorch wheel choice.
-- `BENCHMARK.md`: exact run commands and output descriptions.
-- `CODE_MANIFEST.md`: source file manifest.
+| Target model | Draft model |
+| --- | --- |
+| `Qwen/Qwen3-4B` | [`Huang2020/Qwen3-4B-Domino-b16`](https://huggingface.co/Huang2020/Qwen3-4B-Domino-b16) |
+| `Qwen/Qwen3-8B` | [`Huang2020/Qwen3-8B-Domino-b16`](https://huggingface.co/Huang2020/Qwen3-8B-Domino-b16) |
 
-No result logs or precomputed benchmark numbers are included. Reviewers should run the scripts and inspect the generated outputs.
+## Installation
 
-## HF Setup
-
-Use Python 3.10 or newer on a CUDA GPU machine. Install a PyTorch build that matches the local CUDA driver first, then install the remaining dependencies from this release directory:
+Use Python 3.10 or newer on a CUDA GPU machine. Install a PyTorch build that matches your CUDA driver, then install the remaining dependencies:
 
 ```bash
-cd /path/to/qwen8B-Domino-release
 python -m pip install --upgrade pip
 python -m pip install -r requirements-hf.txt
 ```
 
-If PyTorch is not installed yet, install the CUDA wheel recommended for your system from the PyTorch installation guide, then rerun the requirements command above.
-
-Download the checkpoint with the Google Drive UI or `gdown`:
+For the SGLang benchmark, install the Domino-compatible SGLang branch in the same environment:
 
 ```bash
-python -m pip install gdown
-gdown --folder "https://drive.google.com/drive/folders/1C3eOPxnXnyAnBWmJytp6f2-QWARbztOL" -O ./qwen8B-Domino
+git clone --branch sglang-feat/dflash-domino https://github.com/jianuo-huang/Domino.git sglang-domino
+cd sglang-domino
+python -m pip install -e ./python
+cd -
 ```
 
-Set the target and draft model paths:
+## Hugging Face Benchmark
 
 ```bash
-export TARGET_MODEL="Qwen/Qwen3-8B"
-export DRAFT_MODEL="/path/to/qwen8B-Domino"
-```
-
-`DRAFT_MODEL` must point to the downloaded checkpoint directory. `TARGET_MODEL` may be the Hugging Face model id above or a local Qwen3-8B snapshot directory.
-
-## Run HF Benchmark
-
-A small smoke benchmark runs GSM8K and MATH-500 with four samples each by default:
-
-```bash
-DRAFT_MODEL=/path/to/qwen8B-Domino \
+DRAFT_MODEL=Huang2020/Qwen3-8B-Domino-b16 \
 TARGET_MODEL=Qwen/Qwen3-8B \
 PYTHON=python \
 ./run_hf_benchmark.sh
 ```
 
-The default settings are `max_new_tokens=2048`, `temperature=0.0`, `block_size=16`, `--use-bias`, and `--use-graph`. Override sample counts through `TASKS`, for example:
+Defaults:
+
+- `TASKS=gsm8k:128`
+- `MAX_NEW_TOKENS=2048`
+- `TEMPERATURE=0.0`
+- `BLOCK_SIZE=16`
+- `NUM_GPUS=8`
+
+Override tasks or runtime settings with environment variables:
 
 ```bash
-TASKS="gsm8k:2,math500:2" ./run_hf_benchmark.sh
+TASKS="gsm8k:128,math500:128" NUM_GPUS=4 ./run_hf_benchmark.sh
 ```
 
-Outputs are written under `outputs/hf_<timestamp>/`. Each task gets a log file and an answer JSONL file containing both the block-size-1 baseline and Domino/DFlash generations.
-
-## SGLang Setup
-
-The SGLang server path is kept outside this release package. Install the Domino-compatible SGLang branch before running the SGLang benchmark:
+## SGLang Benchmark
 
 ```bash
-export SGLANG_REPO_URL="https://github.com/jianuo-huang/Domino.git"
-export SGLANG_BRANCH="sglang-feat/dflash-domino"
-
-git clone --branch "${SGLANG_BRANCH}" "${SGLANG_REPO_URL}" sglang-domino
-cd sglang-domino
-python -m pip install -e ./python
-```
-
-Use the same Python environment for the release dependencies:
-
-```bash
-cd /path/to/qwen8B-Domino-release
-python -m pip install -r requirements-hf.txt
-```
-
-Do not use upstream SGLang `main` for this benchmark unless the DFlash speculative backend has been merged there; the stock server does not include the server-side DFlash implementation used by `qwen8B-Domino`. The small Domino alias patch is also included under `sglang_patch/` for reference.
-
-## Run SGLang Benchmark
-
-The default SGLang run uses two samples from each listed task and one client concurrency:
-
-```bash
-DRAFT_MODEL=/path/to/qwen8B-Domino \
+DRAFT_MODEL=Huang2020/Qwen3-8B-Domino-b16 \
 TARGET_MODEL=Qwen/Qwen3-8B \
 PYTHON=python \
 ./run_sglang_benchmark.sh
 ```
 
-Override task counts or concurrency through environment variables:
+Defaults:
+
+- `TASKS=gsm8k:128`
+- `MAX_NEW_TOKENS=2048`
+- `TEMPERATURE=0.0`
+- `CONCURRENCIES=1`
+
+Use these sample counts to reproduce the paper settings:
 
 ```bash
-TASKS="gsm8k:2,math500:2" CONCURRENCIES="1" ./run_sglang_benchmark.sh
+TASKS="gsm8k:128,math500:128,aime24:30,aime25:30,humaneval:164,mbpp:128,livecodebench:128,swe-bench:128,mt-bench:80,alpaca:128"
 ```
 
-Outputs are written under `outputs/sglang_<timestamp>/` as a Markdown report and JSONL records.
+Override tasks or runtime settings with environment variables:
 
-## Expected Run Signal
-
-A successful HF run should print the baseline time, Domino/DFlash time, speedup, and average acceptance length. A successful SGLang run should print output tokens per second and DFlash acceptance length. The exact numbers depend on GPU type, CUDA/PyTorch/SGLang versions, local model cache, and sample count, so this package intentionally does not include fixed benchmark results.
-
-## Notes
-
-- Pairing matters: this checkpoint was trained for Qwen3-8B hidden states.
-- The HF benchmark code is bundled under `code/` and is trimmed to the Domino path used by qwen8B-Domino; no source code from the original internal repositories is required.
-- The SGLang benchmark client is bundled, while the SGLang server implementation comes from the public Domino branch described above.
-- The benchmark downloads public datasets through the Hugging Face `datasets` package unless they are already cached locally.
+```bash
+TASKS="mt-bench:80,alpaca:128" CONCURRENCIES=1 ./run_sglang_benchmark.sh
+```
