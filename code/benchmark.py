@@ -12,7 +12,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from transformers.utils import is_flash_attn_2_available
 from model import sample, load_and_process_dataset, extract_context_feature
-from specforge.modeling.draft.dflash import DFlashDraftModel
+from dflash import DFlashDraftModel
 import distributed as dist
 from kernel.domino import DraftCorrectionGraphRunner
 import os
