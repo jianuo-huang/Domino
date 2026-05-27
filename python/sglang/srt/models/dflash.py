@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
+    _DFLASH_DOMINO_PROJECTORS,
     can_dflash_slice_qkv_weight,
     parse_dflash_draft_config,
 )
@@ -292,25 +293,25 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = draft_config.resolve_block_size(default=16)
 
-        # Optional v5 projector (GRU prefix encoder + MLP that emits a per-step bias on
-        # top of the target lm_head logits). Only created when the checkpoint declares
-        # projector_type=causal_v5; otherwise the draft model is backbone-only.
+        # Optional Domino projector (GRU prefix encoder + MLP that emits a per-step
+        # bias on top of the target lm_head logits). Older checkpoints used
+        # projector_type=causal_v5; public checkpoints use projector_type=domino.
         self.projector_type: Optional[str] = draft_config.projector_type
         self.pure_draft_prefix_len: int = int(draft_config.pure_draft_prefix_len)
         self.shift_label: bool = bool(draft_config.shift_label)
         self.gru_hidden_dim: Optional[int] = draft_config.gru_hidden_dim
         self.emb_dim: Optional[int] = draft_config.emb_dim
 
-        if self.projector_type == "causal_v5":
+        if self.projector_type in _DFLASH_DOMINO_PROJECTORS:
             if self.gru_hidden_dim is None or self.emb_dim is None:
                 raise ValueError(
-                    "DFLASH causal_v5 requires gru_hidden_dim and emb_dim. "
+                    "DFLASH Domino requires gru_hidden_dim and emb_dim. "
                     f"gru_hidden_dim={self.gru_hidden_dim}, emb_dim={self.emb_dim}."
                 )
             vocab_size = int(getattr(config, "vocab_size", 0))
             if vocab_size <= 0:
                 raise ValueError(
-                    f"DFLASH causal_v5 requires positive vocab_size, got {vocab_size}."
+                    f"DFLASH Domino requires positive vocab_size, got {vocab_size}."
                 )
             self.prefix_gru = nn.GRU(
                 input_size=hidden_size,
@@ -383,9 +384,9 @@ class DFlashDraftModel(nn.Module):
         state = getattr(self, "_v5_rollout_state_cache", None)
         if state is not None:
             return state
-        if getattr(self, "projector_type", None) != "causal_v5":
+        if getattr(self, "projector_type", None) not in _DFLASH_DOMINO_PROJECTORS:
             raise RuntimeError(
-                "get_v5_rollout_state called on a non causal_v5 draft model."
+                "get_v5_rollout_state called on a non-Domino draft model."
             )
 
         fc1 = self.embed_proj[0]

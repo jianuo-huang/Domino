@@ -12,11 +12,11 @@ from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
-# Projectors supported by the SGLang DFlash inference path. The HF reference also
-# defines causal_v1/v1_plus/v2/v3/v3_reverse/v4/v5_reverse, but those are not yet
-# wired through SGLang. None means the checkpoint is a "vanilla" backbone-only draft
-# (no extra projector head); causal_v5 is the GRU-prefix + MLP bias projector.
-_DFLASH_SUPPORTED_PROJECTORS: frozenset[Optional[str]] = frozenset({None, "causal_v5"})
+# Projectors supported by the SGLang DFlash inference path. The public Domino
+# checkpoints use projector_type="domino" for the GRU-prefix + MLP bias path.
+# Keep causal_v5 as a backward-compatible alias for older internal checkpoints.
+_DFLASH_DOMINO_PROJECTORS = frozenset({"domino", "causal_v5"})
+_DFLASH_SUPPORTED_PROJECTORS: frozenset[Optional[str]] = frozenset({None, *_DFLASH_DOMINO_PROJECTORS})
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -439,34 +439,34 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         )
     shift_label = bool(shift_label_raw)
 
-    if projector_type == "causal_v5":
+    if projector_type in _DFLASH_DOMINO_PROJECTORS:
         if gru_hidden_dim is None:
             raise ValueError(
-                "DFLASH causal_v5 requires dflash_config.gru_hidden_dim to be set."
+                "DFLASH Domino requires dflash_config.gru_hidden_dim to be set."
             )
         if emb_dim is None:
             raise ValueError(
-                "DFLASH causal_v5 requires top-level config.emb_dim to be set."
+                "DFLASH Domino requires top-level config.emb_dim to be set."
             )
         # The current SGLang adapter only supports the (shift_label=True,
         # pure_draft_prefix_len=1, no bias_gate / bias_norm) configuration. Fail loudly
         # so future variants do not silently mis-decode.
         if not shift_label:
             raise NotImplementedError(
-                "DFLASH causal_v5 currently requires dflash_config.shift_label=True."
+                "DFLASH Domino currently requires dflash_config.shift_label=True."
             )
         if pure_draft_prefix_len != 1:
             raise NotImplementedError(
-                "DFLASH causal_v5 currently requires dflash_config.pure_draft_prefix_len=1, "
+                "DFLASH Domino currently requires dflash_config.pure_draft_prefix_len=1, "
                 f"got {pure_draft_prefix_len}."
             )
         if bool(dflash_cfg.get("use_bias_gate", False)):
             raise NotImplementedError(
-                "DFLASH causal_v5 with use_bias_gate=True is not yet supported by SGLang."
+                "DFLASH Domino with use_bias_gate=True is not yet supported by SGLang."
             )
         if bool(dflash_cfg.get("use_bias_norm", False)):
             raise NotImplementedError(
-                "DFLASH causal_v5 with use_bias_norm=True is not yet supported by SGLang."
+                "DFLASH Domino with use_bias_norm=True is not yet supported by SGLang."
             )
 
     return DFlashDraftConfig(

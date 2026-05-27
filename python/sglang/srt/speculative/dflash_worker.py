@@ -679,7 +679,7 @@ class DFlashWorker:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
-        if getattr(self.draft_model, "projector_type", None) == "causal_v5":
+        if getattr(self.draft_model, "projector_type", None) in {"domino", "causal_v5"}:
             draft_next = self._v5_rollout_draft_block(
                 draft_hidden=draft_hidden,
                 verified_id=block_ids[:, 0],
@@ -1488,7 +1488,7 @@ class DFlashWorker:
         tp_size = int(get_tp_group().world_size)
         if tp_size != 1:
             raise NotImplementedError(
-                "DFLASH causal_v5 rollout currently requires TP=1 in SGLang. "
+                "DFLASH Domino rollout currently requires TP=1 in SGLang. "
                 f"Got tp_size={tp_size}."
             )
 
@@ -1497,7 +1497,7 @@ class DFlashWorker:
         num_added = int(shard.num_added_elements)
         if num_added != 0:
             raise NotImplementedError(
-                "DFLASH causal_v5 rollout does not yet handle added-vocab lm_head shards."
+                "DFLASH Domino rollout does not yet handle added-vocab lm_head shards."
             )
         org_vocab_start = int(shard.org_vocab_start_index)
         num_org = int(shard.num_org_elements)
