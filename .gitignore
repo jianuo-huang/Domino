@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.so
+
+outputs/
+cache/
+.cache/
+
+checkpoints/
+qwen4B-Domino/
+qwen8B-Domino/
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+.DS_Store

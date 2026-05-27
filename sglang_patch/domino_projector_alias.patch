@@ -1,0 +1,150 @@
+diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
+index db78e108e..e087a307e 100644
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.utils import apply_qk_norm
+ from sglang.srt.speculative.dflash_utils import (
++    _DFLASH_DOMINO_PROJECTORS,
+     can_dflash_slice_qkv_weight,
+     parse_dflash_draft_config,
+ )
+@@ -292,25 +293,25 @@ class DFlashDraftModel(nn.Module):
+ 
+         self.block_size = draft_config.resolve_block_size(default=16)
+ 
+-        # Optional v5 projector (GRU prefix encoder + MLP that emits a per-step bias on
+-        # top of the target lm_head logits). Only created when the checkpoint declares
+-        # projector_type=causal_v5; otherwise the draft model is backbone-only.
++        # Optional Domino projector (GRU prefix encoder + MLP that emits a per-step
++        # bias on top of the target lm_head logits). Older checkpoints used
++        # projector_type=causal_v5; public checkpoints use projector_type=domino.
+         self.projector_type: Optional[str] = draft_config.projector_type
+         self.pure_draft_prefix_len: int = int(draft_config.pure_draft_prefix_len)
+         self.shift_label: bool = bool(draft_config.shift_label)
+         self.gru_hidden_dim: Optional[int] = draft_config.gru_hidden_dim
+         self.emb_dim: Optional[int] = draft_config.emb_dim
+ 
+-        if self.projector_type == "causal_v5":
++        if self.projector_type in _DFLASH_DOMINO_PROJECTORS:
+             if self.gru_hidden_dim is None or self.emb_dim is None:
+                 raise ValueError(
+-                    "DFLASH causal_v5 requires gru_hidden_dim and emb_dim. "
++                    "DFLASH Domino requires gru_hidden_dim and emb_dim. "
+                     f"gru_hidden_dim={self.gru_hidden_dim}, emb_dim={self.emb_dim}."
+                 )
+             vocab_size = int(getattr(config, "vocab_size", 0))
+             if vocab_size <= 0:
+                 raise ValueError(
+-                    f"DFLASH causal_v5 requires positive vocab_size, got {vocab_size}."
++                    f"DFLASH Domino requires positive vocab_size, got {vocab_size}."
+                 )
+             self.prefix_gru = nn.GRU(
+                 input_size=hidden_size,
+@@ -383,9 +384,9 @@ class DFlashDraftModel(nn.Module):
+         state = getattr(self, "_v5_rollout_state_cache", None)
+         if state is not None:
+             return state
+-        if getattr(self, "projector_type", None) != "causal_v5":
++        if getattr(self, "projector_type", None) not in _DFLASH_DOMINO_PROJECTORS:
+             raise RuntimeError(
+-                "get_v5_rollout_state called on a non causal_v5 draft model."
++                "get_v5_rollout_state called on a non-Domino draft model."
+             )
+ 
+         fc1 = self.embed_proj[0]
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index ed6d7a960..c4a458730 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -12,11 +12,11 @@ from sglang.srt.utils import is_cuda, is_musa
+ 
+ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+ 
+-# Projectors supported by the SGLang DFlash inference path. The HF reference also
+-# defines causal_v1/v1_plus/v2/v3/v3_reverse/v4/v5_reverse, but those are not yet
+-# wired through SGLang. None means the checkpoint is a "vanilla" backbone-only draft
+-# (no extra projector head); causal_v5 is the GRU-prefix + MLP bias projector.
+-_DFLASH_SUPPORTED_PROJECTORS: frozenset[Optional[str]] = frozenset({None, "causal_v5"})
++# Projectors supported by the SGLang DFlash inference path. The public Domino
++# checkpoints use projector_type="domino" for the GRU-prefix + MLP bias path.
++# Keep causal_v5 as a backward-compatible alias for older internal checkpoints.
++_DFLASH_DOMINO_PROJECTORS = frozenset({"domino", "causal_v5"})
++_DFLASH_SUPPORTED_PROJECTORS: frozenset[Optional[str]] = frozenset({None, *_DFLASH_DOMINO_PROJECTORS})
+ 
+ _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+ _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+@@ -439,34 +439,34 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
+         )
+     shift_label = bool(shift_label_raw)
+ 
+-    if projector_type == "causal_v5":
++    if projector_type in _DFLASH_DOMINO_PROJECTORS:
+         if gru_hidden_dim is None:
+             raise ValueError(
+-                "DFLASH causal_v5 requires dflash_config.gru_hidden_dim to be set."
++                "DFLASH Domino requires dflash_config.gru_hidden_dim to be set."
+             )
+         if emb_dim is None:
+             raise ValueError(
+-                "DFLASH causal_v5 requires top-level config.emb_dim to be set."
++                "DFLASH Domino requires top-level config.emb_dim to be set."
+             )
+         # The current SGLang adapter only supports the (shift_label=True,
+         # pure_draft_prefix_len=1, no bias_gate / bias_norm) configuration. Fail loudly
+         # so future variants do not silently mis-decode.
+         if not shift_label:
+             raise NotImplementedError(
+-                "DFLASH causal_v5 currently requires dflash_config.shift_label=True."
++                "DFLASH Domino currently requires dflash_config.shift_label=True."
+             )
+         if pure_draft_prefix_len != 1:
+             raise NotImplementedError(
+-                "DFLASH causal_v5 currently requires dflash_config.pure_draft_prefix_len=1, "
++                "DFLASH Domino currently requires dflash_config.pure_draft_prefix_len=1, "
+                 f"got {pure_draft_prefix_len}."
+             )
+         if bool(dflash_cfg.get("use_bias_gate", False)):
+             raise NotImplementedError(
+-                "DFLASH causal_v5 with use_bias_gate=True is not yet supported by SGLang."
++                "DFLASH Domino with use_bias_gate=True is not yet supported by SGLang."
+             )
+         if bool(dflash_cfg.get("use_bias_norm", False)):
+             raise NotImplementedError(
+-                "DFLASH causal_v5 with use_bias_norm=True is not yet supported by SGLang."
++                "DFLASH Domino with use_bias_norm=True is not yet supported by SGLang."
+             )
+ 
+     return DFlashDraftConfig(
+diff --git a/python/sglang/srt/speculative/dflash_worker.py b/python/sglang/srt/speculative/dflash_worker.py
+index 02d52967b..b5762df62 100644
+--- a/python/sglang/srt/speculative/dflash_worker.py
++++ b/python/sglang/srt/speculative/dflash_worker.py
+@@ -679,7 +679,7 @@ class DFlashWorker:
+             raise RuntimeError("DFLASH draft model returned no hidden states.")
+         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+ 
+-        if getattr(self.draft_model, "projector_type", None) == "causal_v5":
++        if getattr(self.draft_model, "projector_type", None) in {"domino", "causal_v5"}:
+             draft_next = self._v5_rollout_draft_block(
+                 draft_hidden=draft_hidden,
+                 verified_id=block_ids[:, 0],
+@@ -1488,7 +1488,7 @@ class DFlashWorker:
+         tp_size = int(get_tp_group().world_size)
+         if tp_size != 1:
+             raise NotImplementedError(
+-                "DFLASH causal_v5 rollout currently requires TP=1 in SGLang. "
++                "DFLASH Domino rollout currently requires TP=1 in SGLang. "
+                 f"Got tp_size={tp_size}."
+             )
+ 
+@@ -1497,7 +1497,7 @@ class DFlashWorker:
+         num_added = int(shard.num_added_elements)
+         if num_added != 0:
+             raise NotImplementedError(
+-                "DFLASH causal_v5 rollout does not yet handle added-vocab lm_head shards."
++                "DFLASH Domino rollout does not yet handle added-vocab lm_head shards."
+             )
+         org_vocab_start = int(shard.org_vocab_start_index)
+         num_org = int(shard.num_org_elements)

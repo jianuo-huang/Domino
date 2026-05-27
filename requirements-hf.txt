@@ -1,0 +1,14 @@
+# Install a CUDA-compatible torch build separately if needed.
+# Example: follow https://pytorch.org/get-started/locally/ for the local CUDA driver.
+
+transformers>=4.51.0
+datasets>=2.18.0
+numpy
+tqdm
+rich
+loguru
+triton; platform_system == "Linux"
+typing_extensions
+accelerate
+safetensors
+huggingface_hub
