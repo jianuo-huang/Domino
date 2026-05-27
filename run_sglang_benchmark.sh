@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCHMARK_CODE_ROOT="${BENCHMARK_CODE_ROOT:-${SCRIPT_DIR}/code}"
 PYTHON="${PYTHON:-python}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3-8B}"
-DRAFT_MODEL="${DRAFT_MODEL:-}"
-TASKS="${TASKS:-}"
+DRAFT_MODEL="${DRAFT_MODEL:-Huang2020/Qwen3-8B-Domino-b16}"
+TASKS="${TASKS:-gsm8k:128}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-1.0}"
@@ -18,13 +18,6 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.60}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/outputs/sglang_$(date +%Y%m%d_%H%M%S)}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-${SCRIPT_DIR}/.cache/huggingface}"
-
-if [ -z "${TASKS}" ]; then
-  TASK_LIST=(
-    "gsm8k:128"
-  )
-  TASKS="$(IFS=,; echo "${TASK_LIST[*]}")"
-fi
 
 mkdir -p "${OUT_DIR}"
 

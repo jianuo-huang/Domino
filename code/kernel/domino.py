@@ -15,11 +15,11 @@ except ImportError:
     HAS_TRITON = False
 
 
-def unwrap_domino_mlp(
+def unwrap_correction_mlp(
     embed_proj: nn.Module,
 ) -> Tuple[nn.Linear, nn.Module, nn.Linear]:
     """
-    Domino embed_proj should be:
+    The correction MLP should be:
 
         nn.Sequential(
             nn.Linear(hidden_size + gru_hidden_dim, mlp_hidden_dim),
@@ -32,7 +32,7 @@ def unwrap_domino_mlp(
 
     if not isinstance(embed_proj, nn.Sequential):
         raise TypeError(
-            "DominoGraphRunner requires draft_model.embed_proj to be nn.Sequential."
+            "Graph runner requires draft_model.embed_proj to be nn.Sequential."
         )
 
     modules = list(embed_proj.children())
@@ -59,7 +59,7 @@ def unwrap_domino_mlp(
 
 if HAS_TRITON:
     @triton.jit
-    def _v5_fused_gemv_argmax_kernel(
+    def _fused_mlp_bias_argmax_kernel(
         z_ptr, s_ptr,
         fc2_ptr, base_ptr, fc2_bias_ptr, gate_ptr,
         out_val_ptr, out_idx_ptr,
@@ -145,7 +145,7 @@ if HAS_TRITON:
         tl.store(out_idx_ptr + out_offs, global_max_idx)
 
     @triton.jit
-    def _v5_reduce_argmax_kernel(
+    def _reduce_argmax_kernel(
         out_val_ptr, out_idx_ptr, final_token_ptr,
         N,
         stride_val_b, stride_val_n,
@@ -179,7 +179,7 @@ if HAS_TRITON:
         tl.store(final_token_ptr + pid_b * stride_final_b, best_idx)
 
     @triton.jit
-    def _v5_fused_gru_cell_kernel(
+    def _fused_gru_cell_kernel(
         gi_ptr, gh_ptr, h_ptr, h_out_ptr,
         B, G,
         stride_gi_b, stride_gi_g,
@@ -235,11 +235,11 @@ if HAS_TRITON:
         tl.store(h_out_ptrs, h_new.to(h_ptr.dtype.element_ty), mask=mask_g)
 
 
-class DominoGraphRunner:
+class DraftCorrectionGraphRunner:
     """
-    CUDA Graph runner for Domino with optional Triton fused per-step projection.
+    CUDA Graph runner for block draft correction with optional Triton fused per-step projection.
 
-    Uses inline Triton kernels (_v5_fused_gemv_argmax_kernel + _v5_reduce_argmax_kernel)
+    Uses inline Triton kernels (_fused_mlp_bias_argmax_kernel + _reduce_argmax_kernel)
     to fuse SiLU + fc2 GEMV + base_logits add + argmax into 2 kernel launches per step.
 
     Also supports handwritten GRUCell + precomputed embedding@W_ih.T for the sequential
@@ -269,12 +269,12 @@ class DominoGraphRunner:
         self.prefix_token_count = prefix_token_count
         self.gru_hidden_dim = gru_hidden_dim
 
-        fc1, self.middle, fc2 = unwrap_domino_mlp(draft_model.embed_proj)
+        fc1, self.middle, fc2 = unwrap_correction_mlp(draft_model.embed_proj)
 
         expected_in = hidden_dim + gru_hidden_dim
         if fc1.in_features != expected_in:
             raise ValueError(
-                f"v5 fc1 input dim mismatch: got {fc1.in_features}, "
+                f"Correction MLP input dim mismatch: got {fc1.in_features}, "
                 f"expected {expected_in} = hidden_dim + gru_hidden_dim."
             )
 
@@ -388,7 +388,7 @@ class DominoGraphRunner:
 
     def _forward_impl(self):
         """
-        Graph-captured v5 rollout.
+        Graph-captured correction rollout.
         """
 
         # Precompute H branch:
@@ -481,7 +481,7 @@ class DominoGraphRunner:
 
         # Kernel: GEMV + SiLU + add [bias] + base + [gate] + per-block argmax
         grid = (self._num_v_blocks, B)
-        _v5_fused_gemv_argmax_kernel[grid](
+        _fused_mlp_bias_argmax_kernel[grid](
             z_proj, s_proj,
             self.fc2_weight, base_step, fc2_bias_ptr, gate_ptr,
             self._triton_out_val, self._triton_out_idx,
@@ -498,7 +498,7 @@ class DominoGraphRunner:
         )
 
         # Global argmax reduction
-        _v5_reduce_argmax_kernel[(B,)](
+        _reduce_argmax_kernel[(B,)](
             self._triton_out_val, self._triton_out_idx,
             self._triton_final,
             self._num_v_blocks,
@@ -516,7 +516,7 @@ class DominoGraphRunner:
         BLOCK_G = 256
         grid = (B, (G + BLOCK_G - 1) // BLOCK_G)
 
-        _v5_fused_gru_cell_kernel[grid](
+        _fused_gru_cell_kernel[grid](
             gi, gh, h_state, h_out,
             B, G,
             gi.stride(0), gi.stride(1),

@@ -10,10 +10,11 @@ import torch
 from rich import print
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers.utils import is_flash_attn_2_available
 from model import sample, load_and_process_dataset, extract_context_feature
 from specforge.modeling.draft.dflash import DFlashDraftModel
 import distributed as dist
-from kernel.domino import DominoGraphRunner
+from kernel.domino import DraftCorrectionGraphRunner
 import os
 
 
@@ -283,12 +284,10 @@ def main() -> None:
         logger.info(f"Using specified attention implementation: {attn_impl}")
     else:
         def has_flash_attn():
-            try:
-                import flash_attn
+            if is_flash_attn_2_available():
                 return True
-            except ImportError:
-                logger.warning("flash_attn is not installed. Falling back to torch.sdpa. The speedup will be lower.")
-                return False
+            logger.warning("FlashAttention2 is not available. Falling back to torch.sdpa. The speedup will be lower.")
+            return False
 
         installed_flash_attn = has_flash_attn()
         attn_impl = "flash_attention_2" if installed_flash_attn else "sdpa"
@@ -345,7 +344,7 @@ def main() -> None:
         K = block_size if shift_label else block_size - 1
         steps = K - prefix_len
 
-        graph_runner = DominoGraphRunner(
+        graph_runner = DraftCorrectionGraphRunner(
             draft_model=draft_model,
             target_model=target,
             batch_size=1,
