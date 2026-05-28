@@ -1628,7 +1628,7 @@ class DFlashWorker:
 
             prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
 
-            use_fast_init = False
+            use_fast_init = True
             check_init = False
 
             if use_fast_init or check_init:
