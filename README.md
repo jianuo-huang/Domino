@@ -50,17 +50,6 @@ cd -
 
 This SGLang branch currently resolves to PyTorch 2.11 CUDA 13 wheels. Use the matching SGLang kernel wheel above, and verify that your NVIDIA driver is new enough for CUDA 13 runtime libraries.
 
-The SGLang CUDA 13 wheels ship CUDA runtime libraries inside the Python environment. Add them to `LD_LIBRARY_PATH` before running SGLang:
-
-```bash
-export LD_LIBRARY_PATH="$(python - <<'PY'
-import site
-from pathlib import Path
-print(Path(site.getsitepackages()[0]) / "nvidia" / "cu13" / "lib")
-PY
-):${LD_LIBRARY_PATH:-}"
-```
-
 ## Quick Usage
 
 Domino draft checkpoints provide `spec_generate` for direct speculative decoding with a target model. We currently recommend running this path on one GPU.
@@ -143,7 +132,7 @@ Defaults:
 - `TASKS=gsm8k:128`
 - `MAX_NEW_TOKENS=2048`
 - `TEMPERATURE=0.0`
-- `CONCURRENCIES=1`
+- `CONCURRENCIES=1,2,4,8,16,32`
 
 Use these sample counts to reproduce the paper settings:
 
