@@ -152,4 +152,4 @@ TASKS="mt-bench:80,alpaca:128" CONCURRENCIES=1 ./run_sglang_benchmark.sh
 
 ## Acknowledgements
 
-We thank the authors and maintainers of [DFlash](https://github.com/z-lab/dflash) and [SpecForge](https://github.com/sgl-project/SpecForge). Their open-source work on block-parallel speculative decoding and speculative-decoding training infrastructure helped shape this project and its benchmarking setup.
+We thank the authors and maintainers of [DFlash](https://github.com/z-lab/dflash), [SpecForge](https://github.com/sgl-project/SpecForge), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), and [SGLang](https://github.com/sgl-project/sglang). Their open-source work on block-parallel speculative decoding, speculative-decoding training infrastructure, high-performance attention kernels, and LLM serving helped shape this project and its benchmarking setup.
