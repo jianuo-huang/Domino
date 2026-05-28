@@ -7,6 +7,10 @@ Domino is a speculative decoding method that keeps draft generation block-parall
 
 ![Domino pipeline](asset/pipeline.png)
 
+## Demo
+
+![Domino throughput demo](asset/DFlash_demo.gif)
+
 ## Supported Models
 
 | Target model | Draft model |
@@ -145,3 +149,7 @@ Override tasks or runtime settings with environment variables:
 ```bash
 TASKS="mt-bench:80,alpaca:128" CONCURRENCIES=1 ./run_sglang_benchmark.sh
 ```
+
+## Acknowledgements
+
+We thank the authors and maintainers of [DFlash](https://github.com/z-lab/dflash) and [SpecForge](https://github.com/sgl-project/SpecForge). Their open-source work on block-parallel speculative decoding and speculative-decoding training infrastructure helped shape this project and its benchmarking setup.
