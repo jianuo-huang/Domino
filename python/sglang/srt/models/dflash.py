@@ -340,8 +340,32 @@ class DFlashDraftModel(nn.Module):
         Returns:
             hidden state [B, gru_hidden_dim].
         """
-        _, h = self.prefix_gru(prefix_embeds)
-        return h.squeeze(0)
+        prefix_embeds = prefix_embeds.contiguous()
+        gru = self.prefix_gru
+        hidden_size = int(gru.hidden_size)
+        h = torch.zeros(
+            (prefix_embeds.shape[0], hidden_size),
+            dtype=prefix_embeds.dtype,
+            device=prefix_embeds.device,
+        )
+        w_ih = gru.weight_ih_l0.to(dtype=prefix_embeds.dtype)
+        w_hh = gru.weight_hh_l0.to(dtype=prefix_embeds.dtype)
+        b_ih = gru.bias_ih_l0.to(dtype=prefix_embeds.dtype) if gru.bias else None
+        b_hh = gru.bias_hh_l0.to(dtype=prefix_embeds.dtype) if gru.bias else None
+
+        for step in range(prefix_embeds.shape[1]):
+            gi = F.linear(prefix_embeds[:, step, :], w_ih, b_ih)
+            gh = F.linear(h, w_hh, b_hh)
+            r = torch.sigmoid(gi[:, :hidden_size] + gh[:, :hidden_size])
+            z = torch.sigmoid(
+                gi[:, hidden_size : 2 * hidden_size]
+                + gh[:, hidden_size : 2 * hidden_size]
+            )
+            n = torch.tanh(
+                gi[:, 2 * hidden_size :] + r * gh[:, 2 * hidden_size :]
+            )
+            h = (1.0 - z) * n + z * h
+        return h
 
     def v5_step_gru_hidden(
         self, token_embed: torch.Tensor, gru_h: torch.Tensor
