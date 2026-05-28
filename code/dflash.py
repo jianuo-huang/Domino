@@ -1,3 +1,5 @@
+import time
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 import torch
@@ -32,6 +34,27 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+
+def cuda_time(device: torch.device | str | int | None = None) -> float:
+    if torch.cuda.is_available():
+        if device is None:
+            torch.cuda.synchronize()
+        else:
+            cuda_device = (
+                torch.device(f"cuda:{device}")
+                if isinstance(device, int)
+                else torch.device(device)
+            )
+            if cuda_device.type == "cuda":
+                torch.cuda.synchronize(cuda_device)
+    return time.perf_counter()
+
+
+def apply_domino_bias_gate(model: nn.Module, z_i: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    if getattr(model, "use_bias_gate", False) and hasattr(model, "bias_gate"):
+        bias = torch.sigmoid(model.bias_gate(z_i)) * bias
+    return bias
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -303,6 +326,242 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 **kwargs,
             )
         return self.norm(hidden_states)
+
+    @torch.inference_mode()
+    def spec_generate(
+        self,
+        input_ids: torch.Tensor,
+        target: nn.Module,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.0,
+        stop_token_ids: Optional[list[int] | int] = None,
+        block_size: Optional[int] = None,
+        graph_runner=None,
+        use_bias: bool = True,
+        bias_ablation: Optional[str] = None,
+        confidence_threshold: float = 0.0,
+        return_dict: bool = False,
+    ) -> torch.Tensor | SimpleNamespace:
+        """Generate with Domino speculative decoding.
+
+        This method currently supports a single sequence on one GPU, matching the
+        draft checkpoints released with this repository.
+        """
+        del confidence_threshold  # Kept for compatibility with benchmark flags.
+
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                "spec_generate currently supports input_ids with shape [1, seq_len]."
+            )
+
+        target_device = next(target.parameters()).device
+        if target_device != self.device:
+            raise ValueError(
+                "The draft model and target model must be on the same device; "
+                f"got draft={self.device}, target={target_device}."
+            )
+
+        input_ids = input_ids.to(self.device)
+        block_size = int(block_size or self.block_size)
+        mask_token_id = self.mask_token_id
+        if mask_token_id is None:
+            raise ValueError("The draft model config must define dflash_config.mask_token_id.")
+
+        if isinstance(stop_token_ids, int):
+            stop_token_ids = [stop_token_ids]
+        elif stop_token_ids is not None:
+            stop_token_ids = list(stop_token_ids)
+
+        num_input_tokens = input_ids.shape[1]
+        max_length = num_input_tokens + int(max_new_tokens)
+        shift_label = bool(
+            getattr(self.config, "dflash_config", {}).get("shift_label", False)
+        )
+        extra_buffer = block_size + 1 if shift_label else block_size
+
+        output_ids = torch.full(
+            (1, max_length + extra_buffer),
+            mask_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        position_ids = torch.arange(output_ids.shape[1], device=self.device).unsqueeze(0)
+        past_key_values_target = DynamicCache()
+        past_key_values_draft = DynamicCache()
+
+        prefill_start = cuda_time(self.device)
+        output = target(
+            input_ids,
+            position_ids=position_ids[:, :num_input_tokens],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=block_size > 1,
+        )
+
+        output_ids[:, :num_input_tokens] = input_ids
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
+            output.logits, temperature
+        )
+        if block_size > 1:
+            target_hidden = extract_context_feature(
+                output.hidden_states, self.target_layer_ids
+            )
+        time_to_first_token = cuda_time(self.device) - prefill_start
+
+        decode_start = cuda_time(self.device)
+        start = num_input_tokens
+        acceptance_lengths: list[int] = []
+        draft_prefill = True
+        prefix_len = int(self.pure_draft_prefix_len)
+
+        while start < max_length:
+            block_output_ids = output_ids[:, start : start + block_size].clone()
+            k_draft = block_size if shift_label else block_size - 1
+            verify_ids = torch.full(
+                (1, k_draft + 1),
+                mask_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            verify_ids[:, 0] = output_ids[:, start]
+            verify_position_ids = position_ids[:, start : start + k_draft + 1]
+
+            if block_size > 1:
+                if not is_domino_projector(self.projector_type):
+                    raise ValueError(
+                        "This package only supports Domino checkpoints; "
+                        f"got projector_type={self.projector_type!r}."
+                    )
+                if not use_bias:
+                    raise ValueError("Domino generation requires use_bias=True.")
+
+                noise_embedding = target.model.embed_tokens(block_output_ids)
+                parallel_hiddens = self(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids[
+                        :, past_key_values_draft.get_seq_length() : start + block_size
+                    ],
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                    is_causal=False,
+                )
+                if not shift_label:
+                    parallel_hiddens = parallel_hiddens[:, -block_size + 1 :, :]
+                past_key_values_draft.crop(start)
+
+                base_logits = target.lm_head(parallel_hiddens)
+                if prefix_len > 0:
+                    prefix_token_ids = sample(base_logits[:, :prefix_len], temperature)
+                    verify_ids[:, 1 : 1 + prefix_len] = prefix_token_ids
+
+                if graph_runner is not None:
+                    graph_prefix_ids = verify_ids[:, : 1 + prefix_len].contiguous()
+                    graph_parallel_hiddens = parallel_hiddens[
+                        :, prefix_len:k_draft, :
+                    ].contiguous()
+                    graph_base_logits = base_logits[:, prefix_len:k_draft, :].contiguous()
+                    verify_ids[:, 1 + prefix_len :] = graph_runner(
+                        graph_prefix_ids,
+                        graph_parallel_hiddens,
+                        graph_base_logits,
+                    )
+                else:
+                    realized_prefix_ids = verify_ids[:, : 1 + prefix_len]
+                    realized_prefix_embeds = target.model.embed_tokens(realized_prefix_ids)
+                    _, gru_hidden = self.prefix_gru(realized_prefix_embeds)
+
+                    for i in range(prefix_len, k_draft):
+                        z_i = parallel_hiddens[:, i : i + 1, :]
+                        s_i = gru_hidden.transpose(0, 1)
+
+                        if bias_ablation == "zero_e":
+                            s_i = torch.zeros_like(s_i)
+                        elif bias_ablation == "zero_z":
+                            z_i = torch.zeros_like(z_i)
+                        if self.use_bias_norm:
+                            s_i = self.bias_norm(s_i)
+
+                        bias = self.embed_proj(torch.cat([z_i, s_i], dim=-1))
+                        bias = apply_domino_bias_gate(self, z_i, bias)
+                        current_token_id = sample(
+                            base_logits[:, i : i + 1, :] + bias,
+                            temperature,
+                        )
+                        verify_ids[:, i + 1 : i + 2] = current_token_id
+
+                        if i + 1 < k_draft:
+                            new_embed = target.model.embed_tokens(current_token_id)
+                            _, gru_hidden = self.prefix_gru(new_embed, gru_hidden)
+
+                if draft_prefill:
+                    draft_prefill = False
+                    decode_start = cuda_time(self.device)
+
+            output = target(
+                verify_ids,
+                position_ids=verify_position_ids,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=block_size > 1,
+            )
+
+            posterior = sample(output.logits, temperature)
+            acceptance_length = (
+                (verify_ids[:, 1:] == posterior[:, :-1])
+                .cumprod(dim=1)
+                .sum(dim=1)[0]
+                .item()
+            )
+            output_ids[:, start : start + acceptance_length + 1] = verify_ids[
+                :, : acceptance_length + 1
+            ]
+            output_ids[:, start + acceptance_length + 1] = posterior[
+                :, acceptance_length
+            ]
+
+            acceptance_lengths.append(int(acceptance_length) + 1)
+            start += int(acceptance_length) + 1
+            past_key_values_target.crop(start)
+            if block_size > 1:
+                target_hidden = extract_context_feature(
+                    output.hidden_states, self.target_layer_ids
+                )[:, : acceptance_length + 1, :]
+
+            if stop_token_ids is not None:
+                stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+                if torch.isin(output_ids[:, num_input_tokens:start], stop_tensor).any():
+                    break
+
+        output_ids = output_ids[:, :max_length]
+        output_ids = output_ids[:, output_ids[0] != mask_token_id]
+        if stop_token_ids is not None:
+            stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_token_indices = torch.isin(
+                output_ids[0][num_input_tokens:], stop_tensor
+            ).nonzero(as_tuple=True)[0]
+            if stop_token_indices.numel() > 0:
+                output_ids = output_ids[
+                    :, : num_input_tokens + stop_token_indices[0].item() + 1
+                ]
+
+        if not return_dict:
+            return output_ids
+
+        num_output_tokens = output_ids.shape[1] - num_input_tokens
+        total_decode_time = cuda_time(self.device) - decode_start
+        time_per_output_token = (
+            total_decode_time / num_output_tokens if num_output_tokens > 0 else 0.0
+        )
+        return SimpleNamespace(
+            output_ids=output_ids,
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=num_output_tokens,
+            time_to_first_token=time_to_first_token,
+            time_per_output_token=time_per_output_token,
+            acceptance_lengths=acceptance_lengths,
+        )
     
     def freeze_backbone(self):
         # 1) 冻结主干

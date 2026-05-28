@@ -3,228 +3,18 @@ import json
 import time
 import random
 from itertools import chain
-from types import SimpleNamespace
 from loguru import logger
 import numpy as np
 import torch
 from rich import print
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import is_flash_attn_2_available
-from model import sample, load_and_process_dataset, extract_context_feature
-from dflash import DFlashDraftModel
+from model import load_and_process_dataset
+from dflash import DFlashDraftModel, is_domino_projector
 import distributed as dist
 from kernel.domino import DraftCorrectionGraphRunner
 import os
-
-
-def is_domino_projector(projector_type):
-    return projector_type in {"domino", "causal" + "_v5"}
-
-
-def cuda_time() -> float:
-    torch.cuda.synchronize()
-    return time.perf_counter()
-
-def apply_domino_bias_gate(model, z_i: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """
-    Apply scalar hidden-based gate for Domino inference.
-
-    z_i:
-        [B, 1, hidden_size]
-    bias:
-        [B, 1, vocab_size]
-
-    return:
-        gated bias, [B, 1, vocab_size]
-    """
-    if (
-        getattr(model, "use_bias_gate", False)
-        and hasattr(model, "bias_gate")
-    ):
-        gate = torch.sigmoid(model.bias_gate(z_i))  # [B, 1, 1]
-        bias = gate * bias
-
-    return bias
-
-@torch.inference_mode()
-def dflash_generate(
-    model: DFlashDraftModel,
-    target: AutoModelForCausalLM,
-    input_ids: torch.Tensor,
-    mask_token_id: int,
-    max_new_tokens: int,
-    block_size: int,
-    stop_token_ids: list[int],
-    temperature: float = 0.0,
-    graph_runner=None,
-    use_bias=True,
-    bias_ablation=None,
-    confidence_threshold: float = 0.0,
-) -> SimpleNamespace:
-    num_input_tokens = input_ids.shape[1]
-    max_length = num_input_tokens + max_new_tokens
-    shift_label = bool(getattr(model.config, "dflash_config", {}).get("shift_label", False))
-    extra_buffer = block_size + 1 if shift_label else block_size
-
-    output_ids = torch.full(
-        (1, max_length + extra_buffer),
-        mask_token_id,
-        dtype=torch.long,
-        device=model.device,
-    )
-    position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0)
-    past_key_values_target = DynamicCache()
-    past_key_values_draft = DynamicCache()
-
-    # Prefill stage
-    prefill_start = cuda_time()
-    output = target(
-        input_ids,
-        position_ids=position_ids[:, :num_input_tokens],
-        past_key_values=past_key_values_target,
-        use_cache=True,
-        logits_to_keep=1,
-        output_hidden_states=True if block_size > 1 else False,
-    )
-
-    output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
-    if block_size > 1:
-        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
-
-    time_to_first_token = cuda_time() - prefill_start
-
-    # Decode stage
-    decode_start = cuda_time()
-    start = input_ids.shape[1]
-    acceptance_lengths = []
-    draft_prefill = True
-    projector_type = model.projector_type
-    prefix_len = model.pure_draft_prefix_len
-    while start < max_length:
-        block_output_ids = output_ids[:, start : start + block_size].clone()
-        block_position_ids = position_ids[:, start : start + block_size]
-        K = block_size if shift_label else block_size - 1
-        verify_ids = torch.full(
-            (1, K + 1),
-            mask_token_id,
-            dtype=torch.long,
-            device=model.device,
-        )
-        verify_ids[:, 0] = output_ids[:, start]
-        verify_position_ids = position_ids[:, start : start + K + 1]
-        if block_size > 1:
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            parallel_hiddens = model(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + block_size],
-                past_key_values=past_key_values_draft,
-                use_cache=True,
-                is_causal=False,
-            )
-            if shift_label:
-                parallel_hiddens = parallel_hiddens
-            else:
-                parallel_hiddens = parallel_hiddens[:, -block_size+1:, :]
-            past_key_values_draft.crop(start)
-
-            if not is_domino_projector(projector_type):
-                raise ValueError(
-                    "This reviewer package only supports Domino checkpoints; "
-                    f"got projector_type={projector_type!r}."
-                )
-            if not use_bias:
-                raise ValueError("This reviewer package keeps only the Domino bias path; pass --use-bias.")
-
-            base_logits = target.lm_head(parallel_hiddens)
-            if prefix_len > 0:
-                prefix_token_ids = sample(base_logits[:, :prefix_len], temperature)
-                verify_ids[:, 1 : 1 + prefix_len] = prefix_token_ids
-
-            if graph_runner is not None:
-                graph_prefix_ids = verify_ids[:, :1 + prefix_len].contiguous()
-                graph_parallel_hiddens = parallel_hiddens[:, prefix_len:K, :].contiguous()
-                graph_base_logits = base_logits[:, prefix_len:K, :].contiguous()
-
-                verify_ids[:, 1 + prefix_len:] = graph_runner(
-                    graph_prefix_ids,
-                    graph_parallel_hiddens,
-                    graph_base_logits,
-                )
-            else:
-                realized_prefix_ids = verify_ids[:, : 1 + prefix_len]
-                realized_prefix_embeds = target.model.embed_tokens(realized_prefix_ids)
-                _, gru_hidden = model.prefix_gru(realized_prefix_embeds)
-
-                for i in range(prefix_len, K):
-                    z_i = parallel_hiddens[:, i : i + 1, :]
-                    s_i = gru_hidden.transpose(0, 1)
-
-                    if bias_ablation == "zero_e":
-                        s_i = torch.zeros_like(s_i)
-                    elif bias_ablation == "zero_z":
-                        z_i = torch.zeros_like(z_i)
-                    if model.use_bias_norm:
-                        s_i = model.bias_norm(s_i)
-                    bias = model.embed_proj(torch.cat([z_i, s_i], dim=-1))
-                    bias = apply_domino_bias_gate(model, z_i, bias)
-                    current_logit = base_logits[:, i : i + 1, :]
-                    current_token_id = sample(current_logit + bias, temperature)
-                    verify_ids[:, i + 1 : i + 2] = current_token_id
-
-                    if i + 1 < K:
-                        new_embed = target.model.embed_tokens(current_token_id)
-                        _, gru_hidden = model.prefix_gru(new_embed, gru_hidden)
-            if draft_prefill:
-                draft_prefill = False
-                decode_start = cuda_time()
-
-        output = target(
-            verify_ids,
-            position_ids=verify_position_ids,
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
-        )
-
-        posterior = sample(output.logits, temperature)
-        acceptance_length = (verify_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        output_ids[:, start : start + acceptance_length + 1] = verify_ids[:, : acceptance_length + 1]
-        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
-
-        acceptance_lengths.append(acceptance_length+1)
-        start += acceptance_length + 1
-        past_key_values_target.crop(start)
-        if block_size > 1:
-            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
-        
-        if stop_token_ids is not None and any(
-            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
-        ):
-            break
-
-    output_ids = output_ids[:, :max_length]
-    output_ids = output_ids[:, output_ids[0] != mask_token_id]
-    if stop_token_ids is not None:
-        stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
-        if stop_token_indices.numel() > 0:
-            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
-
-    num_output_tokens = output_ids.shape[1] - num_input_tokens
-    total_decode_time = cuda_time() - decode_start
-    time_per_output_token = total_decode_time / num_output_tokens
-
-    return SimpleNamespace(
-        output_ids=output_ids,
-        num_input_tokens=num_input_tokens,
-        num_output_tokens=num_output_tokens,
-        time_to_first_token=time_to_first_token,
-        time_per_output_token=time_per_output_token,
-        acceptance_lengths=acceptance_lengths,
-    )
 
 
 def main() -> None:
@@ -369,19 +159,18 @@ def main() -> None:
 
             response = {}
             for bs in [1, block_size]:
-                response[bs] = dflash_generate(
-                    model=draft_model,
+                response[bs] = draft_model.spec_generate(
                     target=target,
                     input_ids=input_ids,
-                    mask_token_id=draft_model.mask_token_id,
                     max_new_tokens=args.max_new_tokens,
                     block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
-                    graph_runner = graph_runner,
-                    use_bias = args.use_bias,
+                    graph_runner=graph_runner,
+                    use_bias=args.use_bias,
                     bias_ablation=args.bias_ablation,
                     confidence_threshold=args.confidence_threshold,
+                    return_dict=True,
                 )
 
             # Record results for both b=1 and b=k

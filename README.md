@@ -1,8 +1,9 @@
 # Domino: Decoupling Causal Modeling from Autoregressive Drafting in Speculative Decoding
-
-Domino accelerates large language model inference with speculative decoding. Standard autoregressive decoding is sequential and often memory-bound, leaving GPU parallelism underused. Existing autoregressive draft models improve draft quality by modeling dependencies between draft tokens, but they also introduce sequential drafting overhead.
-
-Domino keeps drafting block-parallel while adding a lightweight causal correction head. The parallel draft backbone proposes a full block at once, and the Domino head injects causal information from previously drafted tokens to refine the draft distributions. This preserves the low cost of parallel drafting while improving acceptance length and end-to-end speedup.
+<p align="center">
+  <a href="TODO"><img src="https://img.shields.io/badge/Paper-TODO-blue" alt="Paper"></a>
+  <a href="https://huggingface.co/collections/Huang2020/domino"><img src="https://img.shields.io/badge/Hugging%20Face-Models-yellow" alt="Hugging Face Models"></a>
+</p>
+Domino is a speculative decoding method that keeps draft generation block-parallel while adding a lightweight causal correction head to improve draft-token acceptance.
 
 ![Domino pipeline](asset/pipeline.png)
 
@@ -15,20 +16,94 @@ Domino keeps drafting block-parallel while adding a lightweight causal correctio
 
 ## Installation
 
-Use Python 3.10 or newer on a CUDA GPU machine. Install a PyTorch build that matches your CUDA driver, then install the remaining dependencies:
+Use Python 3.10 or newer on a CUDA GPU machine. Install a PyTorch build that matches your CUDA driver, then install the remaining Hugging Face benchmark dependencies:
 
 ```bash
 python -m pip install --upgrade pip
 python -m pip install -r requirements-hf.txt
 ```
 
-For the SGLang benchmark, install the Domino-compatible SGLang branch in the same environment:
+For the SGLang benchmark, install the extra build tools first. On Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential ninja-build protobuf-compiler
+```
+
+The SGLang branch also builds a Rust component. Install Rust if `cargo` is not already available:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+Then install the Domino-compatible SGLang branch in the same Python environment:
 
 ```bash
 git clone --branch sglang-feat/dflash-domino https://github.com/jianuo-huang/Domino.git sglang-domino
 cd sglang-domino
 python -m pip install -e ./python
+python -m pip install --force-reinstall --no-deps sglang-kernel \
+  --index-url https://docs.sglang.ai/whl/cu130/
 cd -
+```
+
+This SGLang branch currently resolves to PyTorch 2.11 CUDA 13 wheels. Use the matching SGLang kernel wheel above, and verify that your NVIDIA driver is new enough for CUDA 13 runtime libraries.
+
+The SGLang CUDA 13 wheels ship CUDA runtime libraries inside the Python environment. Add them to `LD_LIBRARY_PATH` before running SGLang:
+
+```bash
+export LD_LIBRARY_PATH="$(python - <<'PY'
+import site
+from pathlib import Path
+print(Path(site.getsitepackages()[0]) / "nvidia" / "cu13" / "lib")
+PY
+):${LD_LIBRARY_PATH:-}"
+```
+
+## Quick Usage
+
+Domino draft checkpoints provide `spec_generate` for direct speculative decoding with a target model. We currently recommend running this path on one GPU.
+
+```python
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+draft_model = AutoModel.from_pretrained(
+    "Huang2020/Qwen3-8B-Domino-b16",
+    trust_remote_code=True,
+    dtype="auto",
+    device_map="cuda:0",
+).eval()
+
+target_model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-8B",
+    dtype="auto",
+    device_map="cuda:0",
+).eval()
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+prompt = "How many positive whole-number divisors does 196 have?"
+messages = [{"role": "user", "content": prompt}]
+
+# The Domino draft model is trained for Qwen3 with thinking mode disabled.
+text = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+    enable_thinking=False,
+)
+model_inputs = tokenizer([text], return_tensors="pt").to(draft_model.device)
+
+output_ids = draft_model.spec_generate(
+    input_ids=model_inputs["input_ids"],
+    target=target_model,
+    max_new_tokens=2048,
+    temperature=0.0,
+    stop_token_ids=[tokenizer.eos_token_id],
+)
+
+generated_ids = output_ids[:, model_inputs["input_ids"].shape[1]:]
+print(tokenizer.decode(generated_ids[0], skip_special_tokens=True))
 ```
 
 ## Hugging Face Benchmark
