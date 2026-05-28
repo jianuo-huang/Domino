@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -55,7 +54,6 @@ def _parse_tasks(spec: str) -> list[tuple[str, int]]:
 def _build_prompts(
     *,
     dataset_name: str,
-    target_model: str,
     tokenizer: AutoTokenizer,
     required_questions: int,
 ) -> list[str]:
@@ -344,7 +342,6 @@ def main() -> None:
     prompts_by_task = {
         dataset_name: _build_prompts(
             dataset_name=dataset_name,
-            target_model=args.target_model,
             tokenizer=tokenizer,
             required_questions=required_questions,
         )

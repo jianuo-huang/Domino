@@ -26,12 +26,10 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--bias-ablation", type=str, default=None)
     parser.add_argument("--use-graph", action="store_true")
     parser.add_argument("--use-bias", action="store_true")
     parser.add_argument("--dump-benchmark-manifest", type=str, default=None)
     parser.add_argument("--dump-only", action="store_true")
-    parser.add_argument("--confidence-threshold", type=float, default=0.0, help="Only inject token info into neighbor when its softmax confidence exceeds this threshold (0.0 = always inject).")
     parser.add_argument("--answer-file", type=str, default=None, help="Output answer file (jsonl) to store generation results for both b=1 and b=k.")
     parser.add_argument("--attn-implementation", type=str, default=None, choices=["eager", "sdpa", "flash_attention_2"], help="Attention implementation for target and draft models. Default: auto-detect flash_attn.")
 
@@ -168,8 +166,6 @@ def main() -> None:
                     temperature=args.temperature,
                     graph_runner=graph_runner,
                     use_bias=args.use_bias,
-                    bias_ablation=args.bias_ablation,
-                    confidence_threshold=args.confidence_threshold,
                     return_dict=True,
                 )
 

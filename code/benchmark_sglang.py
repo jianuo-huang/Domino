@@ -19,6 +19,11 @@ from model import load_and_process_dataset
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 
+try:
+    from sglang.srt.utils import is_blackwell_supported as _sglang_is_blackwell_supported
+except ImportError:
+    _sglang_is_blackwell_supported = None
+
 
 DEFAULT_TARGET_MODEL_DFLASH = "Qwen/Qwen3-8B"
 DEFAULT_DRAFT_MODEL_DFLASH = ""
@@ -79,7 +84,19 @@ def popen_launch_server(model: str, base_url: str, timeout: float, other_args: O
 
 
 def _is_blackwell() -> bool:
-    return False
+    if _sglang_is_blackwell_supported is not None:
+        try:
+            return bool(_sglang_is_blackwell_supported())
+        except Exception:
+            pass
+    try:
+        if not torch.cuda.is_available() or torch.version.cuda is None:
+            return False
+        major, _ = torch.cuda.get_device_capability()
+        cuda_version = tuple(map(int, torch.version.cuda.split(".")[:2]))
+    except Exception:
+        return False
+    return major in (10, 11, 12) and cuda_version >= (12, 8)
 
 
 def _flush_cache(base_url: str) -> None:

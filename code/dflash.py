@@ -338,8 +338,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         block_size: Optional[int] = None,
         graph_runner=None,
         use_bias: bool = True,
-        bias_ablation: Optional[str] = None,
-        confidence_threshold: float = 0.0,
         return_dict: bool = False,
     ) -> torch.Tensor | SimpleNamespace:
         """Generate with Domino speculative decoding.
@@ -347,8 +345,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         This method currently supports a single sequence on one GPU, matching the
         draft checkpoints released with this repository.
         """
-        del confidence_threshold  # Kept for compatibility with benchmark flags.
-
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(
                 "spec_generate currently supports input_ids with shape [1, seq_len]."
@@ -476,10 +472,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                         z_i = parallel_hiddens[:, i : i + 1, :]
                         s_i = gru_hidden.transpose(0, 1)
 
-                        if bias_ablation == "zero_e":
-                            s_i = torch.zeros_like(s_i)
-                        elif bias_ablation == "zero_z":
-                            z_i = torch.zeros_like(z_i)
                         if self.use_bias_norm:
                             s_i = self.bias_norm(s_i)
 
