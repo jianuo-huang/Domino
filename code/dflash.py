@@ -23,7 +23,7 @@ from typing_extensions import Tuple, Unpack
 
 
 def is_domino_projector(projector_type):
-    return projector_type in {"domino", "causal" + "_v5"}
+    return projector_type == "domino"
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -49,12 +49,6 @@ def cuda_time(device: torch.device | str | int | None = None) -> float:
             if cuda_device.type == "cuda":
                 torch.cuda.synchronize(cuda_device)
     return time.perf_counter()
-
-
-def apply_domino_bias_gate(model: nn.Module, z_i: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    if getattr(model, "use_bias_gate", False) and hasattr(model, "bias_gate"):
-        bias = torch.sigmoid(model.bias_gate(z_i)) * bias
-    return bias
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -254,13 +248,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.block_size = config.block_size
         self.mask_token_id = self.config.dflash_config.get("mask_token_id", None)
         self.projector_type = self.config.dflash_config.get("projector_type", None)
-        self.use_bias_norm = self.config.dflash_config.get("use_bias_norm", False)
         self.pure_draft_prefix_len = self.config.dflash_config.get("pure_draft_prefix_len", 0)
-        self.gru_hidden_dim = self.config.dflash_config.get(
-            "gru_hidden_dim", getattr(config, "emb_dim", config.hidden_size // 4)
-        )
-        self.use_bias_gate = self.config.dflash_config.get("use_bias_gate", False)
-        self.bias_gate_init = self.config.dflash_config.get("bias_gate_init", -2.0)
+        self.emb_dim = self.config.dflash_config["emb_dim"]
+        self.gru_hidden_dim = self.config.dflash_config["gru_hidden_dim"]
 
         if not is_domino_projector(self.projector_type):
             raise ValueError(
@@ -275,31 +265,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             batch_first=True,
             bias=False,
         )
-        if self.use_bias_norm:
-            self.bias_norm = Qwen3RMSNorm(self.gru_hidden_dim, eps=config.rms_norm_eps)
 
         in_dim = config.hidden_size + self.gru_hidden_dim
         self.embed_proj = nn.Sequential(
-            nn.Linear(in_dim, config.emb_dim, bias=False),
+            nn.Linear(in_dim, self.emb_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(config.emb_dim, config.vocab_size, bias=False),
+            nn.Linear(self.emb_dim, config.vocab_size, bias=False),
         )
-        if self.use_bias_gate:
-            self.bias_gate = nn.Sequential(
-                nn.Linear(config.hidden_size, config.emb_dim, bias=False),
-                nn.SiLU(),
-                nn.Linear(config.emb_dim, 1, bias=True),
-            )
-            nn.init.constant_(self.bias_gate[-1].bias, self.bias_gate_init)
 
         self.post_init()
-
-        if hasattr(self, "bias_gate"):
-            last_gate_layer = self.bias_gate[-1]
-            if isinstance(last_gate_layer, nn.Linear):
-                nn.init.zeros_(last_gate_layer.weight)
-                if last_gate_layer.bias is not None:
-                    nn.init.constant_(last_gate_layer.bias, self.bias_gate_init)
 
     def forward(
         self,
@@ -472,11 +446,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                         z_i = parallel_hiddens[:, i : i + 1, :]
                         s_i = gru_hidden.transpose(0, 1)
 
-                        if self.use_bias_norm:
-                            s_i = self.bias_norm(s_i)
-
                         bias = self.embed_proj(torch.cat([z_i, s_i], dim=-1))
-                        bias = apply_domino_bias_gate(self, z_i, bias)
                         current_token_id = sample(
                             base_logits[:, i : i + 1, :] + bias,
                             temperature,
@@ -554,34 +524,3 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             time_per_output_token=time_per_output_token,
             acceptance_lengths=acceptance_lengths,
         )
-    
-    def freeze_backbone(self):
-        # 1) 冻结主干
-        for module in [self.layers, self.norm, self.fc, self.hidden_norm]:
-            for p in module.parameters():
-                p.requires_grad = False
-
-        # 2) 解冻 bias 分支
-        if hasattr(self, "embed_proj") and self.embed_proj is not None:
-            for p in self.embed_proj.parameters():
-                p.requires_grad = True
-
-        if hasattr(self, "prefix_gru") and self.prefix_gru is not None:
-            for p in self.prefix_gru.parameters():
-                p.requires_grad = True
-
-
-    def print_trainable_parameters(self):
-        total = 0
-        trainable = 0
-        names = []
-        for n, p in self.named_parameters():
-            num = p.numel()
-            total += num
-            if p.requires_grad:
-                trainable += num
-                names.append(n)
-        print(f"trainable params: {trainable:,} / {total:,}")
-        print("trainable names:")
-        for n in names:
-            print("  ", n)

@@ -8,13 +8,46 @@ import numpy as np
 import torch
 from rich import print
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import is_flash_attn_2_available
 from model import load_and_process_dataset
 from dflash import DFlashDraftModel, is_domino_projector
 import distributed as dist
 from kernel.domino import DraftCorrectionGraphRunner
 import os
+
+
+def normalize_draft_config_for_benchmark(config):
+    dflash_config = dict(getattr(config, "dflash_config", {}) or {})
+
+    if dflash_config.get("projector_type") == "causal_v5":
+        dflash_config["projector_type"] = "domino"
+
+    if "emb_dim" not in dflash_config:
+        emb_dim = getattr(config, "emb_dim", None)
+        if emb_dim is not None:
+            dflash_config["emb_dim"] = emb_dim
+
+    if "gru_hidden_dim" not in dflash_config:
+        gru_hidden_dim = getattr(config, "gru_hidden_dim", None)
+        if gru_hidden_dim is not None:
+            dflash_config["gru_hidden_dim"] = gru_hidden_dim
+        elif "emb_dim" in dflash_config:
+            dflash_config["gru_hidden_dim"] = dflash_config["emb_dim"]
+
+    config.dflash_config = dflash_config
+    return config
+
+
+def load_draft_model_for_benchmark(model_name_or_path: str, attn_impl: str):
+    draft_config = AutoConfig.from_pretrained(model_name_or_path)
+    draft_config = normalize_draft_config_for_benchmark(draft_config)
+    return DFlashDraftModel.from_pretrained(
+        model_name_or_path,
+        config=draft_config,
+        attn_implementation=attn_impl,
+        dtype=torch.bfloat16,
+    )
 
 
 def main() -> None:
@@ -87,10 +120,9 @@ def main() -> None:
         dtype=torch.bfloat16,
     ).to(device).eval()
 
-    draft_model = DFlashDraftModel.from_pretrained(
+    draft_model = load_draft_model_for_benchmark(
         args.draft_name_or_path,
-        attn_implementation=attn_impl,
-        dtype=torch.bfloat16,
+        attn_impl,
     ).to(device).eval()
     logger.info(f"[VERIFY] Target attn_implementation: {target.config._attn_implementation}")
     logger.info(f"[VERIFY] Draft attn_implementation: {draft_model.config._attn_implementation}")

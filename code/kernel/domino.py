@@ -58,7 +58,7 @@ if HAS_TRITON:
     @triton.jit
     def _fused_mlp_bias_argmax_kernel(
         z_ptr, s_ptr,
-        fc2_ptr, base_ptr, fc2_bias_ptr, gate_ptr,
+        fc2_ptr, base_ptr, fc2_bias_ptr,
         out_val_ptr, out_idx_ptr,
         M, V,
         stride_z_b, stride_z_m,
@@ -69,10 +69,9 @@ if HAS_TRITON:
         BLOCK_V: tl.constexpr,
         BLOCK_M: tl.constexpr,
         HAS_FC2_BIAS: tl.constexpr,
-        HAS_GATE: tl.constexpr,
     ):
         """
-        Fused: SiLU(z + s) @ fc2.T + [fc2_bias] + base → [gate *] → per-block argmax.
+        Fused: SiLU(z + s) @ fc2.T + [fc2_bias] + base → per-block argmax.
         Each block handles BLOCK_V vocab entries.
         """
         pid_v = tl.program_id(0)
@@ -125,11 +124,6 @@ if HAS_TRITON:
         ).to(tl.float32)
 
         acc += base_block
-
-        # Apply gate if present (scalar per batch, broadcast to V)
-        if HAS_GATE:
-            gate_val = tl.load(gate_ptr + pid_b).to(tl.float32)
-            acc = gate_val * acc
 
         acc = tl.where(mask_v, acc, -float("inf"))
 
@@ -282,12 +276,6 @@ class DraftCorrectionGraphRunner:
         self.fc2_weight = fc2.weight.detach().contiguous()
         self.fc2_bias = fc2.bias.detach() if fc2.bias is not None else None
 
-        self.use_bias_norm = bool(getattr(draft_model, "use_bias_norm", False))
-        self.use_bias_gate = bool(
-            getattr(draft_model, "use_bias_gate", False)
-            and hasattr(draft_model, "bias_gate")
-        )
-
         # Strict correctness guard: only fuse when middle is exactly SiLU
         self._middle_is_silu = (
             isinstance(self.middle, nn.SiLU)
@@ -297,7 +285,7 @@ class DraftCorrectionGraphRunner:
                 and isinstance(list(self.middle.children())[0], nn.SiLU)
             )
         )
-        # Enable triton fusion whenever middle is SiLU (bias/gate handled in kernel)
+        # Enable triton fusion whenever middle is SiLU (bias handled in kernel)
         self._can_triton_fuse = self._middle_is_silu and HAS_TRITON
 
         dtype = next(draft_model.parameters()).dtype
@@ -396,14 +384,6 @@ class DraftCorrectionGraphRunner:
             self.fc1_bias,
         )  # [B, S, M]
 
-        # Gate only depends on H, so it can be computed once.
-        if self.use_bias_gate:
-            gate_all = torch.sigmoid(
-                self.draft_model.bias_gate(self.static_parallel_hiddens)
-            )  # [B, S, 1]
-        else:
-            gate_all = None
-
         prefix_embeds = self.target_model.model.embed_tokens(
             self.static_prefix_ids
         )
@@ -414,27 +394,20 @@ class DraftCorrectionGraphRunner:
             # s_proj directly from gru_hidden [1,B,G] → squeeze → [B,G] → linear → [B,M]
             h_state = gru_hidden.squeeze(0)  # [B, G]
 
-            if self.use_bias_norm:
-                h_state = self.draft_model.bias_norm(h_state.unsqueeze(1)).squeeze(1)
-
             s_proj = F.linear(h_state, self.w_s, None)  # [B, M]
 
             if self._can_triton_fuse:
-                # Fused: SiLU(z[t]+s_proj) @ fc2.T + [bias] + base[t] → [gate *] → argmax
-                gate_step = gate_all[:, t, :] if gate_all is not None else None
+                # Fused: SiLU(z[t]+s_proj) @ fc2.T + [bias] + base[t] → argmax
                 cur = self._fused_step_triton(
                     z_part_all[:, t, :],            # [B, M]
                     s_proj,                          # [B, M]
                     self.static_base_logits[:, t, :], # [B, V]
-                    gate_val=gate_step,
                 ).unsqueeze(-1)  # [B, 1]
             else:
                 mid = self.middle(
                     z_part_all[:, t:t + 1, :] + s_proj.unsqueeze(1)
                 )  # [B, 1, M]
                 bias = F.linear(mid, self.fc2_weight, self.fc2_bias)
-                if gate_all is not None:
-                    bias = gate_all[:, t:t + 1, :] * bias
                 logits = self.static_base_logits[:, t:t + 1, :] + bias
                 cur = torch.argmax(logits, dim=-1)  # [B, 1]
 
@@ -457,30 +430,27 @@ class DraftCorrectionGraphRunner:
                     h_new = (1.0 - z) * n + z * h_state
                     gru_hidden = h_new.unsqueeze(0)  # [1, B, G]
 
-    def _fused_step_triton(self, z_proj, s_proj, base_step, gate_val=None):
+    def _fused_step_triton(self, z_proj, s_proj, base_step):
         """
-        Fused: SiLU(z_proj + s_proj) @ fc2_weight.T + [fc2_bias] + base_step → [gate *] → argmax.
+        Fused: SiLU(z_proj + s_proj) @ fc2_weight.T + [fc2_bias] + base_step → argmax.
 
         z_proj:   [B, M]
         s_proj:   [B, M]
         base_step: [B, V]
-        gate_val:  [B, 1] or None
         returns:  [B]
         """
         B, M = z_proj.shape
         V = base_step.shape[1]
 
         has_fc2_bias = self.fc2_bias is not None
-        has_gate = gate_val is not None
 
         fc2_bias_ptr = self.fc2_bias if has_fc2_bias else self._triton_out_val
-        gate_ptr = gate_val if has_gate else self._triton_out_val
 
-        # Kernel: GEMV + SiLU + add [bias] + base + [gate] + per-block argmax
+        # Kernel: GEMV + SiLU + add [bias] + base + per-block argmax
         grid = (self._num_v_blocks, B)
         _fused_mlp_bias_argmax_kernel[grid](
             z_proj, s_proj,
-            self.fc2_weight, base_step, fc2_bias_ptr, gate_ptr,
+            self.fc2_weight, base_step, fc2_bias_ptr,
             self._triton_out_val, self._triton_out_idx,
             M, V,
             z_proj.stride(0), z_proj.stride(1),
@@ -491,7 +461,6 @@ class DraftCorrectionGraphRunner:
             BLOCK_V=self._BLOCK_V,
             BLOCK_M=32,
             HAS_FC2_BIAS=has_fc2_bias,
-            HAS_GATE=has_gate,
         )
 
         # Global argmax reduction
