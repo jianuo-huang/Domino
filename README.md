@@ -1,11 +1,16 @@
 # Domino: Decoupling Causal Modeling from Autoregressive Drafting in Speculative Decoding
 <p align="center">
-  <a href="TODO"><img src="https://img.shields.io/badge/Paper-TODO-blue" alt="Paper"></a>
+  <a href="https://arxiv.org/abs/2605.29707"><img src="https://img.shields.io/badge/Paper-arXiv%3A2605.29707-blue" alt="Paper"></a>
   <a href="https://huggingface.co/collections/Huang2020/domino"><img src="https://img.shields.io/badge/Hugging%20Face-Models-yellow" alt="Hugging Face Models"></a>
 </p>
 Domino is a speculative decoding method that keeps draft generation block-parallel while adding a lightweight causal correction head to improve draft-token acceptance.
 
 ![Domino pipeline](asset/pipeline.png)
+
+## News
+
+- [2026-05-30] 🔥🔥 Domino training code released! The training implementation is now available in SpecForge via [sgl-project/SpecForge#571](https://github.com/sgl-project/SpecForge/pull/571).
+- [2026-05-29] 🔥 Domino paper released! Read the paper on [arXiv](https://arxiv.org/abs/2605.29707).
 
 ## Demo
 
@@ -153,3 +158,16 @@ TASKS="mt-bench:80,alpaca:128" CONCURRENCIES=1 ./run_sglang_benchmark.sh
 ## Acknowledgements
 
 We thank the authors and maintainers of [DFlash](https://github.com/z-lab/dflash), [SpecForge](https://github.com/sgl-project/SpecForge), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), and [SGLang](https://github.com/sgl-project/sglang). Their open-source work on block-parallel speculative decoding, speculative-decoding training infrastructure, high-performance attention kernels, and LLM serving helped shape this project and its benchmarking setup.
+
+## Citation
+
+If you use Domino in your research, please cite:
+
+```bibtex
+@article{huang2026domino,
+  title={Domino: Decoupling Causal Modeling from Autoregressive Drafting in Speculative Decoding},
+  author={Huang, Jianuo and Zhang, Yaojie and Zhang, Qituan and Lin, Hao and Xu, Hanlin and Zhang, Linfeng},
+  journal={arXiv preprint arXiv:2605.29707},
+  year={2026}
+}
+```
