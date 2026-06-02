@@ -59,6 +59,31 @@ cd -
 
 This SGLang branch currently resolves to PyTorch 2.11 CUDA 13 wheels. Use the matching SGLang kernel wheel above, and verify that your NVIDIA driver is new enough for CUDA 13 runtime libraries.
 
+For CUDA 12.8 / PyTorch 2.9, patch the SGLang dependency pins before installing:
+
+```bash
+git clone --branch sglang-feat/dflash-domino https://github.com/jianuo-huang/Domino.git sglang-domino
+cd sglang-domino
+
+python -m pip install --upgrade pip
+
+sed -i \
+  -e 's/"torch==2.11.0"/"torch==2.9.1+cu128"/' \
+  -e 's/"torchaudio==2.11.0"/"torchaudio==2.9.1+cu128"/' \
+  -e 's/"torchvision"/"torchvision==0.24.1+cu128"/' \
+  -e 's/"kernels"/"kernels==0.14.1"/' \
+  -e '/"sglang-kernel==0.4.2"/d' \
+  python/pyproject.toml
+
+python -m pip install \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  -e ./python
+python -m pip install --force-reinstall --no-deps "${SGLANG_KERNEL_CU12_WHEEL}"
+cd -
+```
+
+Set `SGLANG_KERNEL_CU12_WHEEL` to a CUDA-12-compatible `sglang-kernel` wheel before running the last command. Do not install the `cu130` wheel in a PyTorch 2.9/cu128 environment.
+
 ## Quick Usage
 
 Domino draft checkpoints provide `spec_generate` for direct speculative decoding with a target model. We currently recommend running this path on one GPU.
