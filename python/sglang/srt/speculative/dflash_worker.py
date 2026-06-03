@@ -894,6 +894,214 @@ class DFlashWorker:
 
         return out_token_ids
 
+    def _global_argmax_from_local_logits(
+        self,
+        *,
+        local_logits: torch.Tensor,
+        local_vocab_start: int,
+    ) -> torch.Tensor:
+        """Select global token ids from per-rank vocab-shard logits."""
+
+        if local_logits.ndim != 2:
+            raise RuntimeError(
+                "DFLASH global argmax expects [batch, local_vocab] logits, "
+                f"got shape={tuple(local_logits.shape)}."
+            )
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+
+        local_max, local_arg = torch.max(local_logits, dim=-1)
+        global_ids = local_arg.to(torch.int64) + int(local_vocab_start)
+        if tp_size == 1:
+            return global_ids.to(torch.long)
+
+        chunk_len = int(local_logits.shape[0])
+        needed = tp_size * chunk_len
+        if (
+            self._draft_greedy_gather_cap < needed
+            or self._draft_greedy_gathered_max_buf is None
+            or self._draft_greedy_gathered_ids_buf is None
+            or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
+            or self._draft_greedy_gathered_max_buf.device != local_logits.device
+        ):
+            self._draft_greedy_gathered_max_buf = torch.empty(
+                (needed,), dtype=local_max.dtype, device=local_logits.device
+            )
+            self._draft_greedy_gathered_ids_buf = torch.empty(
+                (needed,), dtype=global_ids.dtype, device=local_logits.device
+            )
+            self._draft_greedy_gather_cap = needed
+
+        if (
+            self._draft_greedy_index_cap < chunk_len
+            or self._draft_greedy_best_rank_buf is None
+            or self._draft_greedy_rank_index_buf is None
+            or self._draft_greedy_selected_ids_buf is None
+            or self._draft_greedy_best_rank_buf.device != local_logits.device
+            or self._draft_greedy_selected_ids_buf.device != local_logits.device
+        ):
+            self._draft_greedy_best_rank_buf = torch.empty(
+                (chunk_len,), dtype=torch.int64, device=local_logits.device
+            )
+            self._draft_greedy_rank_index_buf = torch.empty(
+                (1, chunk_len), dtype=torch.int64, device=local_logits.device
+            )
+            self._draft_greedy_selected_ids_buf = torch.empty(
+                (1, chunk_len), dtype=torch.int64, device=local_logits.device
+            )
+            self._draft_greedy_index_cap = chunk_len
+
+        gathered_max = self._draft_greedy_gathered_max_buf[:needed]
+        gathered_ids = self._draft_greedy_gathered_ids_buf[:needed]
+        tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+        tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+
+        gathered_max = gathered_max.view(tp_size, chunk_len)
+        gathered_ids = gathered_ids.view(tp_size, chunk_len)
+        best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
+        torch.argmax(gathered_max, dim=0, out=best_rank)
+
+        rank_index = self._draft_greedy_rank_index_buf[:, :chunk_len]
+        rank_index[0].copy_(best_rank)
+        selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
+        torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
+        return selected_ids.view(-1).to(torch.long)
+
+    def _v5_rollout_draft_block_tp_eager(
+        self,
+        *,
+        z: torch.Tensor,
+        verified_id: torch.Tensor,
+        target_model,
+        lm_head,
+        org_vocab_start: int,
+        num_org: int,
+        state: dict,
+    ) -> torch.Tensor:
+        """Correctness-first Domino rollout for TP>1.
+
+        Each rank scores its local vocab shard, then synchronizes the winning
+        token after every step because the selected token feeds the next GRU
+        state. This intentionally avoids candidate-pool and CUDA-graph paths.
+        """
+
+        bs, num_draft, hidden_size = z.shape
+        device = z.device
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        embed_module = target_model.get_input_embeddings()
+        draft_model = self.draft_model
+        gru_input_table = draft_model.get_v5_gru_input_proj_table(embed_module.weight)
+
+        z_for_dtype = z.to(weight_dtype) if z.dtype != weight_dtype else z
+        base_logits = torch.matmul(
+            z_for_dtype.reshape(bs * num_draft, hidden_size),
+            weight[:num_org].T,
+        ).view(bs, num_draft, num_org)
+
+        out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+        slot_1 = self._global_argmax_from_local_logits(
+            local_logits=base_logits[:, 0, :],
+            local_vocab_start=org_vocab_start,
+        )
+        out[:, 0].copy_(slot_1)
+
+        prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
+        prefix_gi = self._v5_lookup_gru_input_proj_tp(
+            token_ids=prefix_ids,
+            local_gru_input_table=gru_input_table,
+            org_vocab_start=org_vocab_start,
+            num_org=num_org,
+        )
+        gru_h = torch.zeros(
+            (bs, int(state["gru_hidden_size"])),
+            dtype=prefix_gi.dtype,
+            device=device,
+        )
+        for t_idx in range(int(prefix_ids.shape[1])):
+            gru_h = self._v5_manual_gru_step_from_input_proj(
+                gi=prefix_gi[:, t_idx, :],
+                gru_h=gru_h,
+                state=state,
+            )
+
+        z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
+        fc2_w = state["fc2_weight"][
+            org_vocab_start : org_vocab_start + num_org
+        ].contiguous()
+        fc2_b = (
+            state["fc2_bias"][org_vocab_start : org_vocab_start + num_org].contiguous()
+            if state["fc2_bias"] is not None
+            else None
+        )
+
+        for k in range(1, num_draft):
+            s_proj = torch.nn.functional.linear(gru_h, state["w_s"], None)
+            mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
+            bias_local = torch.nn.functional.linear(mid, fc2_w, fc2_b)
+            logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
+            tok = self._global_argmax_from_local_logits(
+                local_logits=logits_k,
+                local_vocab_start=org_vocab_start,
+            )
+            out[:, k].copy_(tok)
+            if k + 1 < num_draft:
+                gi = self._v5_lookup_gru_input_proj_tp(
+                    token_ids=tok,
+                    local_gru_input_table=gru_input_table,
+                    org_vocab_start=org_vocab_start,
+                    num_org=num_org,
+                )
+                gru_h = self._v5_manual_gru_step_from_input_proj(
+                    gi=gi,
+                    gru_h=gru_h,
+                    state=state,
+                )
+
+        return out
+
+    def _v5_lookup_gru_input_proj_tp(
+        self,
+        *,
+        token_ids: torch.Tensor,
+        local_gru_input_table: torch.Tensor,
+        org_vocab_start: int,
+        num_org: int,
+    ) -> torch.Tensor:
+        """Lookup token GRU input projections from vocab shards and all-reduce."""
+
+        if num_org <= 0:
+            raise RuntimeError("DFLASH TP GRU input lookup got an empty vocab shard.")
+
+        flat_ids = token_ids.to(torch.long).reshape(-1)
+        in_local = (flat_ids >= int(org_vocab_start)) & (
+            flat_ids < int(org_vocab_start + num_org)
+        )
+        local_idx = (flat_ids - int(org_vocab_start)).clamp_(0, int(num_org) - 1)
+        local_gi = torch.index_select(
+            local_gru_input_table, 0, local_idx
+        ).contiguous()
+        local_gi.masked_fill_(~in_local.unsqueeze(-1), 0)
+        global_gi = get_tp_group().all_reduce(local_gi)
+        return global_gi.view(*token_ids.shape, local_gru_input_table.shape[-1])
+
+    def _v5_manual_gru_step_from_input_proj(
+        self,
+        *,
+        gi: torch.Tensor,
+        gru_h: torch.Tensor,
+        state: dict,
+    ) -> torch.Tensor:
+        """Run one GRU step from precomputed input projection gates."""
+
+        G = int(state["gru_hidden_size"])
+        gh = torch.nn.functional.linear(gru_h, state["w_hh"], state["b_hh"])
+        r = torch.sigmoid(gi[:, :G] + gh[:, :G])
+        z_gate = torch.sigmoid(gi[:, G : 2 * G] + gh[:, G : 2 * G])
+        n = torch.tanh(gi[:, 2 * G :] + r * gh[:, 2 * G :])
+        return (1.0 - z_gate) * n + z_gate * gru_h
+
     def _accumulate_and_print_breakdown(self, breakdown: dict) -> None:
         """Accumulate per-step loop timings and print summary every N calls."""
         acc = getattr(self, "_v5_breakdown_acc", None)
@@ -1488,11 +1696,6 @@ class DFlashWorker:
 
         device = draft_hidden.device
         tp_size = int(get_tp_group().world_size)
-        if tp_size != 1:
-            raise NotImplementedError(
-                "DFLASH Domino rollout currently requires TP=1 in SGLang. "
-                f"Got tp_size={tp_size}."
-            )
 
         weight = lm_head.weight
         shard = lm_head.shard_indices
@@ -1595,6 +1798,17 @@ class DFlashWorker:
             z = draft_hidden[:, 1:, :].contiguous()  # [B, num_draft, hidden]
 
         state = draft_model.get_v5_rollout_state()
+        if tp_size != 1:
+            return self._v5_rollout_draft_block_tp_eager(
+                z=z,
+                verified_id=verified_id,
+                target_model=target_model,
+                lm_head=lm_head,
+                org_vocab_start=org_vocab_start,
+                num_org=num_org,
+                state=state,
+            )
+
         G = state["gru_hidden_size"]
         emb_dim = int(state["w_z"].shape[0])
         z_for_dtype = z.to(weight.dtype) if z.dtype != weight.dtype else z
