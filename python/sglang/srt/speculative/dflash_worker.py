@@ -899,6 +899,7 @@ class DFlashWorker:
         *,
         local_logits: torch.Tensor,
         local_vocab_start: int,
+        local_token_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Select global token ids from per-rank vocab-shard logits."""
 
@@ -912,7 +913,17 @@ class DFlashWorker:
         tp_size = int(tp_group.world_size)
 
         local_max, local_arg = torch.max(local_logits, dim=-1)
-        global_ids = local_arg.to(torch.int64) + int(local_vocab_start)
+        if local_token_ids is None:
+            global_ids = local_arg.to(torch.int64) + int(local_vocab_start)
+        else:
+            if tuple(local_token_ids.shape) != tuple(local_logits.shape):
+                raise RuntimeError(
+                    "DFLASH global argmax token-id shape mismatch. "
+                    f"logits={tuple(local_logits.shape)}, ids={tuple(local_token_ids.shape)}."
+                )
+            global_ids = torch.gather(
+                local_token_ids.to(torch.int64), 1, local_arg.unsqueeze(1)
+            ).view(-1)
         if tp_size == 1:
             return global_ids.to(torch.long)
 
@@ -1035,16 +1046,57 @@ class DFlashWorker:
             if state["fc2_bias"] is not None
             else None
         )
+        candidate_pool_size = max(
+            0, int(os.environ.get("DFLASH_V5_CANDIDATE_POOL", "1024"))
+        )
+        if candidate_pool_size > 0 and candidate_pool_size >= num_org:
+            candidate_pool_size = 0
+        candidate_ids = None
+        candidate_token_ids = None
+        candidate_fc2_w = None
+        candidate_fc2_b = None
+        if candidate_pool_size > 0 and num_draft > 1:
+            pool_source = base_logits[:, 1:, :]
+            pool_logits = pool_source.max(dim=1).values
+            candidate_ids = torch.topk(
+                pool_logits, k=candidate_pool_size, dim=-1
+            ).indices.contiguous()
+            candidate_token_ids = candidate_ids.to(torch.int64) + int(org_vocab_start)
+            candidate_fc2_w = fc2_w.index_select(0, candidate_ids.reshape(-1)).view(
+                bs, candidate_pool_size, -1
+            )
+            if fc2_b is not None:
+                candidate_fc2_b = fc2_b.index_select(
+                    0, candidate_ids.reshape(-1)
+                ).view(bs, candidate_pool_size)
 
         for k in range(1, num_draft):
             s_proj = torch.nn.functional.linear(gru_h, state["w_s"], None)
             mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
-            bias_local = torch.nn.functional.linear(mid, fc2_w, fc2_b)
-            logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
-            tok = self._global_argmax_from_local_logits(
-                local_logits=logits_k,
-                local_vocab_start=org_vocab_start,
-            )
+            if candidate_ids is None:
+                bias_local = torch.nn.functional.linear(mid, fc2_w, fc2_b)
+                logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
+                tok = self._global_argmax_from_local_logits(
+                    local_logits=logits_k,
+                    local_vocab_start=org_vocab_start,
+                )
+            else:
+                assert candidate_fc2_w is not None
+                assert candidate_token_ids is not None
+                bias_local = torch.bmm(
+                    candidate_fc2_w, mid.unsqueeze(-1)
+                ).squeeze(-1)
+                if candidate_fc2_b is not None:
+                    bias_local = bias_local + candidate_fc2_b
+                logits_k = (
+                    torch.gather(base_logits[:, k, :], 1, candidate_ids)
+                    + bias_local.to(base_logits.dtype)
+                )
+                tok = self._global_argmax_from_local_logits(
+                    local_logits=logits_k,
+                    local_vocab_start=org_vocab_start,
+                    local_token_ids=candidate_token_ids,
+                )
             out[:, k].copy_(tok)
             if k + 1 < num_draft:
                 gi = self._v5_lookup_gru_input_proj_tp(
