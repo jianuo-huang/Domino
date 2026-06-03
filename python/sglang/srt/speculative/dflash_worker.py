@@ -1447,15 +1447,17 @@ class DFlashWorker:
     ) -> torch.Tensor:
         """Sequential v5 rollout to produce `block_size - 1` draft tokens.
 
-        Algorithm (mirrors dflash benchmark.py:244-264, adapted to SGLang's
-        shift_label-style block where one slot is reserved for the current
-        token):
-          1. slot_1 = argmax(base_logits[0]).
-          2. Initialize prefix_gru on embeddings of [verified_id, slot_1] to get gru_h.
-          3. For k = 2..block_size-1:
+        Algorithm mirrors dflash benchmark.py:244-264 for both
+        shift_label=True and shift_label=False. SGLang's draft block reserves
+        slot 0 for the current verified token and emits slots 1..block_size-1:
+          1. Select z so z[:, 0] predicts slot_1 under the checkpoint's label
+             alignment.
+          2. slot_1 = argmax(base_logits[0]).
+          3. Initialize prefix_gru on embeddings of [verified_id, slot_1] to get gru_h.
+          4. For k = 1..block_size-2:
                  bias = embed_proj(cat(z_k, gru_h))
-                 slot_k = argmax(base_logits[k-1] + bias)
-                 gru_h = prefix_gru_step(embed(slot_k))
+                 slot_{k+1} = argmax(base_logits[k] + bias)
+                 gru_h = prefix_gru_step(embed(slot_{k+1}))
 
         Implementation note: the per-step embed_proj/GRU calls have non-trivial
         Python + cuDNN launch overhead.  We pre-split fc1.weight along its input

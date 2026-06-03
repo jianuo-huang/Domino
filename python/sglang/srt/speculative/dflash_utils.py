@@ -448,25 +448,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             raise ValueError(
                 "DFLASH Domino requires top-level config.emb_dim to be set."
             )
-        # The current SGLang adapter only supports the (shift_label=True,
-        # pure_draft_prefix_len=1, no bias_gate / bias_norm) configuration. Fail loudly
-        # so future variants do not silently mis-decode.
-        if not shift_label:
-            raise NotImplementedError(
-                "DFLASH Domino currently requires dflash_config.shift_label=True."
-            )
+        # The current SGLang adapter supports both shift_label=True and
+        # shift_label=False Domino/causal_v5 alignment, while still assuming the
+        # single pure-draft prefix token.
         if pure_draft_prefix_len != 1:
             raise NotImplementedError(
                 "DFLASH Domino currently requires dflash_config.pure_draft_prefix_len=1, "
                 f"got {pure_draft_prefix_len}."
-            )
-        if bool(dflash_cfg.get("use_bias_gate", False)):
-            raise NotImplementedError(
-                "DFLASH Domino with use_bias_gate=True is not yet supported by SGLang."
-            )
-        if bool(dflash_cfg.get("use_bias_norm", False)):
-            raise NotImplementedError(
-                "DFLASH Domino with use_bias_norm=True is not yet supported by SGLang."
             )
 
     return DFlashDraftConfig(
