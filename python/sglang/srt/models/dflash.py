@@ -430,6 +430,7 @@ class DFlashDraftModel(nn.Module):
         state = {
             "w_z": w_z,
             "w_s": w_s,
+            "w_s_hh_T": torch.cat([w_s.T, w_hh.T], dim=1).contiguous(),
             "b1": b1,
             "fc2_weight": fc2.weight.detach(),
             "fc2_bias": fc2.bias.detach() if fc2.bias is not None else None,

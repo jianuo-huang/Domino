@@ -35,7 +35,9 @@ from sglang.srt.speculative.dflash_v5_kernels import (
     fused_gru_cell_from_table,
     fused_mid_fc2_argmax,
     fused_silu_fc2_argmax,
+    fused_silu_fc2_argmax_with_value,
     fused_silu_fc2_candidate_argmax,
+    fused_silu_fc2_candidate_argmax_with_value,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -231,6 +233,11 @@ class DFlashWorker:
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_pair_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gathered_pair_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_selected_ids_f32_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_pair_cap: int = 0
+        self._draft_greedy_pair_tp_size: int = 0
         self._draft_greedy_gather_cap: int = 0
         self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
@@ -739,6 +746,17 @@ class DFlashWorker:
 
         tp_group = get_tp_group()
         tp_size = int(tp_group.world_size)
+        prof_enabled = os.environ.get("DFLASH_PROF_GREEDY") == "1" and hidden_states.is_cuda
+
+        def prof_mark():
+            if not prof_enabled:
+                return None
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            return ev
+
+        evt_total_start = prof_mark()
+        chunk_events = [] if prof_enabled else None
 
         if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
             raise RuntimeError(
@@ -786,6 +804,7 @@ class DFlashWorker:
             end = min(num_tokens, start + int(chunk_size))
             hs = _cast_hs(hidden_states[start:end])
             chunk_len = int(hs.shape[0])
+            evt_local_start = prof_mark()
 
             # Base vocab logits.
             if num_org > 0:
@@ -831,9 +850,12 @@ class DFlashWorker:
                 global_ids[~is_base] = added_vocab_start + (
                     local_arg[~is_base] - num_org_padded
                 )
+            evt_local_end = prof_mark()
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
+                if prof_enabled:
+                    chunk_events.append((evt_local_start, evt_local_end, evt_local_end))
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
@@ -891,7 +913,63 @@ class DFlashWorker:
             selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_token_ids[start:end].copy_(selected_ids.view(-1))
+            evt_reduce_end = prof_mark()
+            if prof_enabled:
+                chunk_events.append((evt_local_start, evt_local_end, evt_reduce_end))
 
+        evt_total_end = prof_mark()
+        if prof_enabled:
+            torch.cuda.synchronize()
+
+            def elapsed(start, end):
+                if start is None or end is None:
+                    return 0.0
+                return start.elapsed_time(end)
+
+            local_ms = 0.0
+            reduce_ms = 0.0
+            for local_start, local_end, reduce_end in chunk_events:
+                local_ms += elapsed(local_start, local_end)
+                reduce_ms += elapsed(local_end, reduce_end)
+            total_ms = elapsed(evt_total_start, evt_total_end)
+            prof = getattr(self, "_greedy_prof", None)
+            if prof is None:
+                prof = {
+                    "n": 0,
+                    "print_every": int(
+                        os.environ.get("DFLASH_PROF_GREEDY_PRINT_EVERY", "20")
+                    ),
+                    "window": [],
+                    "window_size": int(
+                        os.environ.get("DFLASH_PROF_GREEDY_WINDOW", "20")
+                    ),
+                    "local_sum": 0.0,
+                    "reduce_sum": 0.0,
+                    "total_sum": 0.0,
+                }
+                self._greedy_prof = prof
+            prof["n"] += 1
+            prof["local_sum"] += local_ms
+            prof["reduce_sum"] += reduce_ms
+            prof["total_sum"] += total_ms
+            prof["window"].append((local_ms, reduce_ms, total_ms))
+            if len(prof["window"]) > prof["window_size"]:
+                prof["window"].pop(0)
+            if self.tp_rank == 0 and prof["n"] % max(prof["print_every"], 1) == 0:
+                n = prof["n"]
+                win = prof["window"]
+                win_n = max(len(win), 1)
+                logger.warning(
+                    "[DFLASH greedy prof] rank=%d n_calls=%d tokens=%d "
+                    "total=%.3fms(win %.3f) local=%.3f reduce=%.3f",
+                    self.tp_rank,
+                    n,
+                    num_tokens,
+                    prof["total_sum"] / n,
+                    sum(item[2] for item in win) / win_n,
+                    prof["local_sum"] / n,
+                    prof["reduce_sum"] / n,
+                )
         return out_token_ids
 
     def _global_argmax_from_local_logits(
@@ -909,9 +987,6 @@ class DFlashWorker:
                 f"got shape={tuple(local_logits.shape)}."
             )
 
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-
         local_max, local_arg = torch.max(local_logits, dim=-1)
         if local_token_ids is None:
             global_ids = local_arg.to(torch.int64) + int(local_vocab_start)
@@ -924,23 +999,118 @@ class DFlashWorker:
             global_ids = torch.gather(
                 local_token_ids.to(torch.int64), 1, local_arg.unsqueeze(1)
             ).view(-1)
+        return self._global_argmax_from_local_max(
+            local_max=local_max,
+            global_ids=global_ids,
+        )
+
+    def _global_argmax_from_local_max(
+        self,
+        *,
+        local_max: torch.Tensor,
+        global_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select global token ids from per-rank local max values and ids."""
+
+        if local_max.ndim != 1 or global_ids.ndim != 1:
+            raise RuntimeError(
+                "DFLASH global argmax expects 1D max/id tensors, "
+                f"got local_max={tuple(local_max.shape)}, global_ids={tuple(global_ids.shape)}."
+            )
+        if int(local_max.shape[0]) != int(global_ids.shape[0]):
+            raise RuntimeError(
+                "DFLASH global argmax max/id length mismatch: "
+                f"local_max={tuple(local_max.shape)}, global_ids={tuple(global_ids.shape)}."
+            )
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
         if tp_size == 1:
             return global_ids.to(torch.long)
 
-        chunk_len = int(local_logits.shape[0])
+        chunk_len = int(local_max.shape[0])
+
+        pack_mode = os.environ.get("DFLASH_TP_PACK_ARGMAX", "1").lower()
+        vocab_size = int(
+            getattr(self.target_worker.model_runner.model_config, "vocab_size", 0) or 0
+        )
+        can_pack_ids = (
+            pack_mode not in {"0", "false", "off", "disable", "disabled"}
+            and 0 < vocab_size < (1 << 24)
+        )
+        if can_pack_ids:
+            # Pack score and token id into a tiny fp32 tensor so TP argmax needs
+            # one all-gather instead of separate score/id collectives. Token ids
+            # below 2^24 are exactly representable in fp32.
+            if (
+                self._draft_greedy_pair_cap != chunk_len
+                or self._draft_greedy_pair_tp_size != tp_size
+                or self._draft_greedy_local_pair_buf is None
+                or self._draft_greedy_gathered_pair_buf is None
+                or self._draft_greedy_selected_ids_f32_buf is None
+                or self._draft_greedy_local_pair_buf.device != local_max.device
+            ):
+                self._draft_greedy_local_pair_buf = torch.empty(
+                    (2, chunk_len), dtype=torch.float32, device=local_max.device
+                )
+                self._draft_greedy_gathered_pair_buf = torch.empty(
+                    (tp_size, 2, chunk_len),
+                    dtype=torch.float32,
+                    device=local_max.device,
+                )
+                self._draft_greedy_selected_ids_f32_buf = torch.empty(
+                    (1, chunk_len), dtype=torch.float32, device=local_max.device
+                )
+                self._draft_greedy_pair_cap = chunk_len
+                self._draft_greedy_pair_tp_size = tp_size
+
+            local_pair = self._draft_greedy_local_pair_buf
+            gathered_pair = self._draft_greedy_gathered_pair_buf
+            assert local_pair is not None
+            assert gathered_pair is not None
+            local_pair[0].copy_(local_max.float())
+            local_pair[1].copy_(global_ids.to(torch.float32))
+            tp_group.all_gather_into_tensor(gathered_pair, local_pair)
+
+            if (
+                self._draft_greedy_index_cap < chunk_len
+                or self._draft_greedy_best_rank_buf is None
+                or self._draft_greedy_rank_index_buf is None
+                or self._draft_greedy_best_rank_buf.device != local_max.device
+            ):
+                self._draft_greedy_best_rank_buf = torch.empty(
+                    (chunk_len,), dtype=torch.int64, device=local_max.device
+                )
+                self._draft_greedy_rank_index_buf = torch.empty(
+                    (1, chunk_len), dtype=torch.int64, device=local_max.device
+                )
+                self._draft_greedy_index_cap = chunk_len
+
+            gathered_max = gathered_pair[:, 0, :]
+            gathered_ids = gathered_pair[:, 1, :]
+            best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
+            torch.argmax(gathered_max, dim=0, out=best_rank)
+
+            rank_index = self._draft_greedy_rank_index_buf[:, :chunk_len]
+            rank_index[0].copy_(best_rank)
+            selected_ids_f32 = self._draft_greedy_selected_ids_f32_buf
+            assert selected_ids_f32 is not None
+            torch.gather(gathered_ids, 0, rank_index, out=selected_ids_f32)
+            return selected_ids_f32.view(-1).to(torch.long)
+
         needed = tp_size * chunk_len
         if (
             self._draft_greedy_gather_cap < needed
             or self._draft_greedy_gathered_max_buf is None
             or self._draft_greedy_gathered_ids_buf is None
             or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
-            or self._draft_greedy_gathered_max_buf.device != local_logits.device
+            or self._draft_greedy_gathered_max_buf.device != local_max.device
         ):
             self._draft_greedy_gathered_max_buf = torch.empty(
-                (needed,), dtype=local_max.dtype, device=local_logits.device
+                (needed,), dtype=local_max.dtype, device=local_max.device
             )
             self._draft_greedy_gathered_ids_buf = torch.empty(
-                (needed,), dtype=global_ids.dtype, device=local_logits.device
+                (needed,), dtype=global_ids.dtype, device=local_max.device
             )
             self._draft_greedy_gather_cap = needed
 
@@ -949,17 +1119,17 @@ class DFlashWorker:
             or self._draft_greedy_best_rank_buf is None
             or self._draft_greedy_rank_index_buf is None
             or self._draft_greedy_selected_ids_buf is None
-            or self._draft_greedy_best_rank_buf.device != local_logits.device
-            or self._draft_greedy_selected_ids_buf.device != local_logits.device
+            or self._draft_greedy_best_rank_buf.device != local_max.device
+            or self._draft_greedy_selected_ids_buf.device != local_max.device
         ):
             self._draft_greedy_best_rank_buf = torch.empty(
-                (chunk_len,), dtype=torch.int64, device=local_logits.device
+                (chunk_len,), dtype=torch.int64, device=local_max.device
             )
             self._draft_greedy_rank_index_buf = torch.empty(
-                (1, chunk_len), dtype=torch.int64, device=local_logits.device
+                (1, chunk_len), dtype=torch.int64, device=local_max.device
             )
             self._draft_greedy_selected_ids_buf = torch.empty(
-                (1, chunk_len), dtype=torch.int64, device=local_logits.device
+                (1, chunk_len), dtype=torch.int64, device=local_max.device
             )
             self._draft_greedy_index_cap = chunk_len
 
@@ -988,13 +1158,15 @@ class DFlashWorker:
         lm_head,
         org_vocab_start: int,
         num_org: int,
+        num_org_padded: int,
         state: dict,
     ) -> torch.Tensor:
-        """Correctness-first Domino rollout for TP>1.
+        """Domino rollout for TP>1.
 
         Each rank scores its local vocab shard, then synchronizes the winning
         token after every step because the selected token feeds the next GRU
-        state. This intentionally avoids candidate-pool and CUDA-graph paths.
+        state. This path keeps the TP collectives explicit while using fused
+        local scoring and table-based GRU input lookup when available.
         """
 
         bs, num_draft, hidden_size = z.shape
@@ -1003,28 +1175,83 @@ class DFlashWorker:
         weight_dtype = weight.dtype
         embed_module = target_model.get_input_embeddings()
         draft_model = self.draft_model
+        valid_vocab_size = int(
+            getattr(lm_head, "org_vocab_size", 0)
+            or getattr(self.target_worker.model_runner.model_config, "vocab_size", 0)
+            or int(state["fc2_weight"].shape[0])
+        )
+        if valid_vocab_size <= 0:
+            raise RuntimeError(
+                f"DFLASH TP replicated scorer cannot resolve valid vocab size: {valid_vocab_size}."
+            )
+        if valid_vocab_size > int(state["fc2_weight"].shape[0]):
+            raise RuntimeError(
+                "DFLASH Domino fc2 vocab is smaller than the target org vocab: "
+                f"fc2_vocab={int(state['fc2_weight'].shape[0])}, "
+                f"target_vocab={valid_vocab_size}."
+            )
+        full_lm_head_weight = self._get_v5_tp_full_lm_head_weight(
+            local_lm_head_weight=weight,
+            org_vocab_start=org_vocab_start,
+            num_org_padded=num_org_padded,
+            valid_vocab_size=valid_vocab_size,
+        )
+        use_replicated_scorer = full_lm_head_weight is not None
+        prof_enabled = os.environ.get("DFLASH_PROF_V5_TP") == "1" and z.is_cuda
+
+        def prof_mark():
+            if not prof_enabled:
+                return None
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            return ev
+
+        evt_total_start = prof_mark()
+        evt_table_start = prof_mark()
         gru_input_table = draft_model.get_v5_gru_input_proj_table(embed_module.weight)
+        full_gru_input_table = self._get_v5_tp_full_gru_input_table(
+            local_gru_input_table=gru_input_table,
+            org_vocab_start=org_vocab_start,
+            num_org_padded=num_org_padded,
+        )
+        evt_table_end = prof_mark()
 
         z_for_dtype = z.to(weight_dtype) if z.dtype != weight_dtype else z
+        score_weight = full_lm_head_weight if use_replicated_scorer else weight[:num_org]
+        score_vocab_size = valid_vocab_size if use_replicated_scorer else num_org
+        evt_base_start = prof_mark()
         base_logits = torch.matmul(
             z_for_dtype.reshape(bs * num_draft, hidden_size),
-            weight[:num_org].T,
-        ).view(bs, num_draft, num_org)
+            score_weight.T,
+        ).view(bs, num_draft, score_vocab_size)
+        evt_base_end = prof_mark()
 
         out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
-        slot_1 = self._global_argmax_from_local_logits(
-            local_logits=base_logits[:, 0, :],
-            local_vocab_start=org_vocab_start,
-        )
+        evt_slot1_start = prof_mark()
+        if use_replicated_scorer:
+            slot_1 = torch.argmax(base_logits[:, 0, :], dim=-1).to(torch.long)
+        else:
+            slot_1 = self._global_argmax_from_local_logits(
+                local_logits=base_logits[:, 0, :],
+                local_vocab_start=org_vocab_start,
+            )
+        evt_slot1_end = prof_mark()
         out[:, 0].copy_(slot_1)
 
         prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
-        prefix_gi = self._v5_lookup_gru_input_proj_tp(
-            token_ids=prefix_ids,
-            local_gru_input_table=gru_input_table,
-            org_vocab_start=org_vocab_start,
-            num_org=num_org,
-        )
+        evt_init_start = prof_mark()
+        if full_gru_input_table is not None:
+            prefix_gi = self._v5_lookup_gru_input_proj_full(
+                token_ids=prefix_ids,
+                full_gru_input_table=full_gru_input_table,
+            )
+        else:
+            prefix_gi = self._v5_lookup_gru_input_proj_tp(
+                token_ids=prefix_ids,
+                local_gru_input_table=gru_input_table,
+                org_vocab_start=org_vocab_start,
+                num_org=num_org,
+            )
         gru_h = torch.zeros(
             (bs, int(state["gru_hidden_size"])),
             dtype=prefix_gi.dtype,
@@ -1036,53 +1263,200 @@ class DFlashWorker:
                 gru_h=gru_h,
                 state=state,
             )
+        evt_init_end = prof_mark()
 
+        evt_zproj_start = prof_mark()
         z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
-        fc2_w = state["fc2_weight"][
-            org_vocab_start : org_vocab_start + num_org
-        ].contiguous()
-        fc2_b = (
-            state["fc2_bias"][org_vocab_start : org_vocab_start + num_org].contiguous()
-            if state["fc2_bias"] is not None
-            else None
-        )
+        evt_zproj_end = prof_mark()
+        if use_replicated_scorer:
+            fc2_w = state["fc2_weight"][:valid_vocab_size].contiguous()
+            fc2_b = (
+                state["fc2_bias"][:valid_vocab_size].contiguous()
+                if state["fc2_bias"] is not None
+                else None
+            )
+        else:
+            fc2_w = state["fc2_weight"][
+                org_vocab_start : org_vocab_start + num_org
+            ].contiguous()
+            fc2_b = (
+                state["fc2_bias"][
+                    org_vocab_start : org_vocab_start + num_org
+                ].contiguous()
+                if state["fc2_bias"] is not None
+                else None
+            )
         candidate_pool_size = max(
             0, int(os.environ.get("DFLASH_V5_CANDIDATE_POOL", "1024"))
         )
-        if candidate_pool_size > 0 and candidate_pool_size >= num_org:
+        if candidate_pool_size > 0 and candidate_pool_size >= score_vocab_size:
             candidate_pool_size = 0
+        fused_score_mode = os.environ.get("DFLASH_V5_TP_FUSED_SCORE", "1").lower()
+        use_fused_score = z.is_cuda and fused_score_mode not in {
+            "0",
+            "false",
+            "off",
+            "disable",
+            "disabled",
+        }
         candidate_ids = None
         candidate_token_ids = None
         candidate_fc2_w = None
         candidate_fc2_b = None
+        evt_candidate_start = prof_mark()
         if candidate_pool_size > 0 and num_draft > 1:
             pool_source = base_logits[:, 1:, :]
             pool_logits = pool_source.max(dim=1).values
             candidate_ids = torch.topk(
                 pool_logits, k=candidate_pool_size, dim=-1
             ).indices.contiguous()
-            candidate_token_ids = candidate_ids.to(torch.int64) + int(org_vocab_start)
-            candidate_fc2_w = fc2_w.index_select(0, candidate_ids.reshape(-1)).view(
-                bs, candidate_pool_size, -1
-            )
-            if fc2_b is not None:
-                candidate_fc2_b = fc2_b.index_select(
-                    0, candidate_ids.reshape(-1)
-                ).view(bs, candidate_pool_size)
+            if not use_fused_score:
+                candidate_token_ids = candidate_ids.to(torch.int64)
+                if not use_replicated_scorer:
+                    candidate_token_ids = candidate_token_ids + int(org_vocab_start)
+                candidate_fc2_w = fc2_w.index_select(0, candidate_ids.reshape(-1)).view(
+                    bs, candidate_pool_size, -1
+                )
+                if fc2_b is not None:
+                    candidate_fc2_b = fc2_b.index_select(
+                        0, candidate_ids.reshape(-1)
+                    ).view(bs, candidate_pool_size)
+        evt_candidate_end = prof_mark()
 
+        if use_fused_score:
+            block_v = int(os.environ.get("DFLASH_V5_TP_BLOCK_V", "512"))
+            block_m = int(os.environ.get("DFLASH_V5_TP_BLOCK_M", "32"))
+            score_num_warps = int(os.environ.get("DFLASH_V5_TP_SCORE_NUM_WARPS", "4"))
+            score_num_stages = int(os.environ.get("DFLASH_V5_TP_SCORE_NUM_STAGES", "3"))
+            candidate_block_c = int(
+                os.environ.get("DFLASH_V5_TP_CANDIDATE_BLOCK_C", "512")
+            )
+            num_score_blocks = (
+                (candidate_pool_size + candidate_block_c - 1) // candidate_block_c
+                if candidate_ids is not None
+                else (score_vocab_size + block_v - 1) // block_v
+            )
+            score_val_buf = torch.empty(
+                (bs, num_score_blocks), dtype=torch.float32, device=device
+            )
+            score_idx_buf = torch.empty(
+                (bs, num_score_blocks), dtype=torch.int32, device=device
+            )
+            local_tok_buf = torch.empty((bs,), dtype=torch.long, device=device)
+            local_val_buf = (
+                None
+                if use_replicated_scorer
+                else torch.empty((bs,), dtype=torch.float32, device=device)
+            )
+
+        G = int(state["gru_hidden_size"])
+        emb_dim = int(state["w_z"].shape[0])
+        w_s_hh_T = state.get("w_s_hh_T", None)
+        evt_loop_start = prof_mark()
+        step_events = [] if prof_enabled else None
         for k in range(1, num_draft):
-            s_proj = torch.nn.functional.linear(gru_h, state["w_s"], None)
-            mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
-            if candidate_ids is None:
+            evt_step_start = prof_mark()
+            gh = None
+            if w_s_hh_T is not None and k + 1 < num_draft:
+                sh = torch.matmul(gru_h, w_s_hh_T)
+                s_proj = sh[:, :emb_dim]
+                gh = sh[:, emb_dim : emb_dim + 3 * G]
+            else:
+                s_proj = torch.nn.functional.linear(gru_h, state["w_s"], None)
+            evt_proj_end = prof_mark()
+            if use_fused_score:
+                if candidate_ids is None:
+                    if use_replicated_scorer:
+                        fused_silu_fc2_argmax(
+                            z_proj=z_proj_all[:, k, :],
+                            s_proj=s_proj,
+                            fc2_weight=fc2_w,
+                            fc2_bias=fc2_b,
+                            base_logits=base_logits[:, k, :],
+                            out_val=score_val_buf,
+                            out_idx=score_idx_buf,
+                            final_token=local_tok_buf,
+                            block_v=block_v,
+                            block_m=block_m,
+                            num_warps=score_num_warps,
+                            num_stages=score_num_stages,
+                        )
+                    else:
+                        assert local_val_buf is not None
+                        fused_silu_fc2_argmax_with_value(
+                            z_proj=z_proj_all[:, k, :],
+                            s_proj=s_proj,
+                            fc2_weight=fc2_w,
+                            fc2_bias=fc2_b,
+                            base_logits=base_logits[:, k, :],
+                            out_val=score_val_buf,
+                            out_idx=score_idx_buf,
+                            final_token=local_tok_buf,
+                            final_value=local_val_buf,
+                            block_v=block_v,
+                            block_m=block_m,
+                            num_warps=score_num_warps,
+                            num_stages=score_num_stages,
+                        )
+                else:
+                    if use_replicated_scorer:
+                        fused_silu_fc2_candidate_argmax(
+                            z_proj=z_proj_all[:, k, :],
+                            s_proj=s_proj,
+                            fc2_weight=fc2_w,
+                            fc2_bias=fc2_b,
+                            base_logits=base_logits[:, k, :],
+                            candidate_ids=candidate_ids,
+                            out_val=score_val_buf,
+                            out_idx=score_idx_buf,
+                            final_token=local_tok_buf,
+                            block_c=candidate_block_c,
+                            block_m=block_m,
+                            num_warps=score_num_warps,
+                            num_stages=score_num_stages,
+                        )
+                    else:
+                        assert local_val_buf is not None
+                        fused_silu_fc2_candidate_argmax_with_value(
+                            z_proj=z_proj_all[:, k, :],
+                            s_proj=s_proj,
+                            fc2_weight=fc2_w,
+                            fc2_bias=fc2_b,
+                            base_logits=base_logits[:, k, :],
+                            candidate_ids=candidate_ids,
+                            out_val=score_val_buf,
+                            out_idx=score_idx_buf,
+                            final_token=local_tok_buf,
+                            final_value=local_val_buf,
+                            block_c=candidate_block_c,
+                            block_m=block_m,
+                            num_warps=score_num_warps,
+                            num_stages=score_num_stages,
+                        )
+                evt_score_end = prof_mark()
+                if use_replicated_scorer:
+                    tok = local_tok_buf.to(torch.long)
+                else:
+                    tok = self._global_argmax_from_local_max(
+                        local_max=local_val_buf,
+                        global_ids=local_tok_buf.to(torch.int64) + int(org_vocab_start),
+                    )
+            elif candidate_ids is None:
+                mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
                 bias_local = torch.nn.functional.linear(mid, fc2_w, fc2_b)
                 logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
-                tok = self._global_argmax_from_local_logits(
-                    local_logits=logits_k,
-                    local_vocab_start=org_vocab_start,
-                )
+                evt_score_end = prof_mark()
+                if use_replicated_scorer:
+                    tok = torch.argmax(logits_k, dim=-1).to(torch.long)
+                else:
+                    tok = self._global_argmax_from_local_logits(
+                        local_logits=logits_k,
+                        local_vocab_start=org_vocab_start,
+                    )
             else:
                 assert candidate_fc2_w is not None
                 assert candidate_token_ids is not None
+                mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
                 bias_local = torch.bmm(
                     candidate_fc2_w, mid.unsqueeze(-1)
                 ).squeeze(-1)
@@ -1092,26 +1466,391 @@ class DFlashWorker:
                     torch.gather(base_logits[:, k, :], 1, candidate_ids)
                     + bias_local.to(base_logits.dtype)
                 )
-                tok = self._global_argmax_from_local_logits(
-                    local_logits=logits_k,
-                    local_vocab_start=org_vocab_start,
-                    local_token_ids=candidate_token_ids,
-                )
+                evt_score_end = prof_mark()
+                if use_replicated_scorer:
+                    local_arg = torch.argmax(logits_k, dim=-1)
+                    tok = torch.gather(
+                        candidate_token_ids, 1, local_arg.unsqueeze(1)
+                    ).view(-1)
+                else:
+                    tok = self._global_argmax_from_local_logits(
+                        local_logits=logits_k,
+                        local_vocab_start=org_vocab_start,
+                        local_token_ids=candidate_token_ids,
+                    )
+            evt_reduce_end = prof_mark()
             out[:, k].copy_(tok)
             if k + 1 < num_draft:
-                gi = self._v5_lookup_gru_input_proj_tp(
-                    token_ids=tok,
-                    local_gru_input_table=gru_input_table,
-                    org_vocab_start=org_vocab_start,
-                    num_org=num_org,
+                if full_gru_input_table is not None:
+                    gi = self._v5_lookup_gru_input_proj_full(
+                        token_ids=tok,
+                        full_gru_input_table=full_gru_input_table,
+                    )
+                else:
+                    gi = self._v5_lookup_gru_input_proj_tp(
+                        token_ids=tok,
+                        local_gru_input_table=gru_input_table,
+                        org_vocab_start=org_vocab_start,
+                        num_org=num_org,
+                    )
+                if gh is None:
+                    gru_h = self._v5_manual_gru_step_from_input_proj(
+                        gi=gi,
+                        gru_h=gru_h,
+                        state=state,
+                    )
+                else:
+                    gru_h = self._v5_manual_gru_step_from_projections(
+                        gi=gi,
+                        gh=gh,
+                        gru_h=gru_h,
+                        state=state,
+                    )
+            evt_gru_end = prof_mark()
+            if prof_enabled:
+                step_events.append(
+                    (
+                        evt_step_start,
+                        evt_proj_end,
+                        evt_score_end,
+                        evt_reduce_end,
+                        evt_gru_end,
+                    )
                 )
-                gru_h = self._v5_manual_gru_step_from_input_proj(
-                    gi=gi,
-                    gru_h=gru_h,
-                    state=state,
+
+        evt_loop_end = prof_mark()
+        evt_total_end = prof_mark()
+        if prof_enabled:
+            torch.cuda.synchronize()
+
+            def elapsed(start, end):
+                if start is None or end is None:
+                    return 0.0
+                return start.elapsed_time(end)
+
+            step_proj_ms = 0.0
+            step_score_ms = 0.0
+            step_reduce_ms = 0.0
+            step_gru_ms = 0.0
+            for s0, s1, s2, s3, s4 in step_events:
+                step_proj_ms += elapsed(s0, s1)
+                step_score_ms += elapsed(s1, s2)
+                step_reduce_ms += elapsed(s2, s3)
+                step_gru_ms += elapsed(s3, s4)
+
+            values = {
+                "table_ms": elapsed(evt_table_start, evt_table_end),
+                "base_ms": elapsed(evt_base_start, evt_base_end),
+                "slot1_ms": elapsed(evt_slot1_start, evt_slot1_end),
+                "init_ms": elapsed(evt_init_start, evt_init_end),
+                "zproj_ms": elapsed(evt_zproj_start, evt_zproj_end),
+                "candidate_ms": elapsed(evt_candidate_start, evt_candidate_end),
+                "loop_ms": elapsed(evt_loop_start, evt_loop_end),
+                "step_proj_ms": step_proj_ms,
+                "step_score_ms": step_score_ms,
+                "step_reduce_ms": step_reduce_ms,
+                "step_gru_ms": step_gru_ms,
+                "total_ms": elapsed(evt_total_start, evt_total_end),
+            }
+            prof = getattr(self, "_v5_tp_prof", None)
+            if prof is None:
+                prof = {
+                    "n": 0,
+                    "print_every": int(
+                        os.environ.get("DFLASH_PROF_V5_TP_PRINT_EVERY", "20")
+                    ),
+                    "sums": {k: 0.0 for k in values},
+                    "window": [],
+                    "window_size": int(
+                        os.environ.get("DFLASH_PROF_V5_TP_WINDOW", "20")
+                    ),
+                }
+                self._v5_tp_prof = prof
+            prof["n"] += 1
+            for key, value in values.items():
+                prof["sums"][key] += value
+            prof["window"].append(values)
+            if len(prof["window"]) > prof["window_size"]:
+                prof["window"].pop(0)
+            if self.tp_rank == 0 and prof["n"] % max(prof["print_every"], 1) == 0:
+                n = prof["n"]
+                win = prof["window"]
+
+                def avg(key):
+                    return prof["sums"][key] / n
+
+                def win_avg(key):
+                    return sum(item[key] for item in win) / max(len(win), 1)
+
+                logger.warning(
+                    "[DFLASH v5 TP prof] rank=%d bs=%d n_calls=%d "
+                    "scorer=%s total=%.3fms(win %.3f) table=%.3f base=%.3f slot1=%.3f "
+                    "init=%.3f zproj=%.3f candidate=%.3f loop=%.3f(win %.3f) "
+                    "loop_parts: proj=%.3f score=%.3f reduce=%.3f gru=%.3f",
+                    self.tp_rank,
+                    bs,
+                    n,
+                    "replicated" if use_replicated_scorer else "tp_reduce",
+                    avg("total_ms"),
+                    win_avg("total_ms"),
+                    avg("table_ms"),
+                    avg("base_ms"),
+                    avg("slot1_ms"),
+                    avg("init_ms"),
+                    avg("zproj_ms"),
+                    avg("candidate_ms"),
+                    avg("loop_ms"),
+                    win_avg("loop_ms"),
+                    avg("step_proj_ms"),
+                    avg("step_score_ms"),
+                    avg("step_reduce_ms"),
+                    avg("step_gru_ms"),
                 )
 
         return out
+
+    def _get_v5_tp_full_lm_head_weight(
+        self,
+        *,
+        local_lm_head_weight: torch.Tensor,
+        org_vocab_start: int,
+        num_org_padded: int,
+        valid_vocab_size: int,
+    ) -> Optional[torch.Tensor]:
+        """Replicate the target lm_head org-vocab shards for Domino TP rollout.
+
+        Domino's GRU state depends on the exact token sampled at each draft step.
+        If the scorer remains vocab-parallel, every step needs a TP global argmax
+        before the next GRU step can run. Replicating the full org-vocab lm_head
+        lets each rank compute the same winning token locally and removes that
+        per-step collective. This is an optimization-only path and can be disabled
+        with DFLASH_V5_TP_REPLICATE_SCORER=0.
+        """
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        if tp_size == 1:
+            return local_lm_head_weight[:valid_vocab_size]
+
+        mode = os.environ.get("DFLASH_V5_TP_REPLICATE_SCORER", "auto").lower()
+        if mode in {"0", "false", "off", "disable", "disabled"}:
+            return None
+        if mode not in {"1", "true", "on", "enable", "enabled", "auto"}:
+            if not getattr(self, "_v5_tp_replicate_scorer_bad_mode_warned", False):
+                logger.warning(
+                    "Ignoring invalid DFLASH_V5_TP_REPLICATE_SCORER=%r; "
+                    "expected auto/1/0. Falling back to auto.",
+                    mode,
+                )
+                self._v5_tp_replicate_scorer_bad_mode_warned = True
+            mode = "auto"
+
+        if num_org_padded <= 0:
+            return None
+        expected_org_start = int(tp_group.rank_in_group) * int(num_org_padded)
+        if int(org_vocab_start) != expected_org_start:
+            if not getattr(self, "_v5_tp_replicate_scorer_layout_warned", False):
+                logger.warning(
+                    "DFLASH TP replicated scorer disabled because vocab shard layout "
+                    "is not direct padded-org concat: org_vocab_start=%d, expected=%d.",
+                    int(org_vocab_start),
+                    expected_org_start,
+                )
+                self._v5_tp_replicate_scorer_layout_warned = True
+            return None
+
+        full_padded_vocab_size = tp_size * int(num_org_padded)
+        if int(valid_vocab_size) > full_padded_vocab_size:
+            raise RuntimeError(
+                "DFLASH TP replicated scorer valid vocab exceeds padded org vocab: "
+                f"valid_vocab_size={int(valid_vocab_size)}, "
+                f"full_padded_vocab_size={full_padded_vocab_size}."
+            )
+        if int(local_lm_head_weight.shape[0]) < int(num_org_padded):
+            raise RuntimeError(
+                "DFLASH TP lm_head shard is smaller than the padded org-vocab shard: "
+                f"weight_rows={int(local_lm_head_weight.shape[0])}, "
+                f"num_org_padded={int(num_org_padded)}."
+            )
+
+        hidden_size = int(local_lm_head_weight.shape[-1])
+        local_org_weight = local_lm_head_weight[: int(num_org_padded)].contiguous()
+        cache_key = (
+            local_lm_head_weight.data_ptr(),
+            int(num_org_padded),
+            int(valid_vocab_size),
+            hidden_size,
+            local_lm_head_weight.dtype,
+            local_lm_head_weight.device,
+            tp_size,
+        )
+        cached = getattr(self, "_v5_tp_full_lm_head_weight_cache", None)
+        if cached is not None and cached.get("key") == cache_key:
+            return cached["weight"]
+
+        required_bytes = (
+            tp_size
+            * int(num_org_padded)
+            * hidden_size
+            * local_lm_head_weight.element_size()
+        )
+        if mode == "auto" and local_lm_head_weight.device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(local_lm_head_weight.device)
+            cushion = int(os.environ.get("DFLASH_V5_TP_SCORER_CUSHION_MB", "2048"))
+            if int(free_bytes) < required_bytes + cushion * 1024 * 1024:
+                if not getattr(self, "_v5_tp_replicate_scorer_mem_warned", False):
+                    logger.warning(
+                        "DFLASH TP replicated scorer disabled by auto memory check: "
+                        "need %.2f GiB + %d MiB cushion, free %.2f GiB. "
+                        "Set DFLASH_V5_TP_REPLICATE_SCORER=1 to force or 0 to silence.",
+                        required_bytes / (1024**3),
+                        cushion,
+                        int(free_bytes) / (1024**3),
+                    )
+                    self._v5_tp_replicate_scorer_mem_warned = True
+                return None
+
+        full_padded_weight = torch.empty(
+            (full_padded_vocab_size, hidden_size),
+            dtype=local_lm_head_weight.dtype,
+            device=local_lm_head_weight.device,
+        )
+        tp_group.all_gather_into_tensor(full_padded_weight, local_org_weight)
+        full_weight = full_padded_weight[: int(valid_vocab_size)]
+        self._v5_tp_full_lm_head_weight_cache = {
+            "key": cache_key,
+            "weight": full_weight,
+            "full_padded_weight": full_padded_weight,
+        }
+        if not getattr(self, "_v5_tp_replicate_scorer_logged", False):
+            logger.info(
+                "DFLASH TP replicated scorer enabled. lm_head_shape=%s, memory=%.2f GiB",
+                tuple(full_weight.shape),
+                required_bytes / (1024**3),
+            )
+            self._v5_tp_replicate_scorer_logged = True
+        return full_weight
+
+    def _get_v5_tp_full_gru_input_table(
+        self,
+        *,
+        local_gru_input_table: torch.Tensor,
+        org_vocab_start: int,
+        num_org_padded: int,
+    ) -> Optional[torch.Tensor]:
+        """Replicate the padded org-vocab GRU input table across TP ranks.
+
+        In the TP eager rollout the selected draft token is global, so the next
+        GRU input projection currently requires one all-reduce per generated
+        draft token. Gathering the padded org-vocab table once lets every rank
+        index by global token id directly. The gathered layout is TP-concatenated
+        padded org shards, so valid base token ids map to the same row id.
+        """
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        if tp_size == 1:
+            return local_gru_input_table
+
+        mode = os.environ.get("DFLASH_V5_TP_REPLICATE_GRU_TABLE", "auto").lower()
+        if mode in {"0", "false", "off", "disable", "disabled"}:
+            return None
+        if mode not in {"1", "true", "on", "enable", "enabled", "auto"}:
+            if not getattr(self, "_v5_tp_replicate_gru_table_bad_mode_warned", False):
+                logger.warning(
+                    "Ignoring invalid DFLASH_V5_TP_REPLICATE_GRU_TABLE=%r; "
+                    "expected auto/1/0. Falling back to auto.",
+                    mode,
+                )
+                self._v5_tp_replicate_gru_table_bad_mode_warned = True
+            mode = "auto"
+
+        if num_org_padded <= 0:
+            return None
+        expected_org_start = int(tp_group.rank_in_group) * int(num_org_padded)
+        if int(org_vocab_start) != expected_org_start:
+            if not getattr(self, "_v5_tp_replicate_gru_table_layout_warned", False):
+                logger.warning(
+                    "DFLASH TP replicated GRU table disabled because vocab shard layout "
+                    "is not direct padded-org concat: org_vocab_start=%d, expected=%d.",
+                    int(org_vocab_start),
+                    expected_org_start,
+                )
+                self._v5_tp_replicate_gru_table_layout_warned = True
+            return None
+        if int(local_gru_input_table.shape[0]) < int(num_org_padded):
+            raise RuntimeError(
+                "DFLASH TP GRU input table is smaller than the padded org-vocab shard: "
+                f"table_rows={int(local_gru_input_table.shape[0])}, "
+                f"num_org_padded={int(num_org_padded)}."
+            )
+
+        width = int(local_gru_input_table.shape[-1])
+        local_org_table = local_gru_input_table[: int(num_org_padded)].contiguous()
+        cache_key = (
+            local_gru_input_table.data_ptr(),
+            int(num_org_padded),
+            width,
+            local_gru_input_table.dtype,
+            local_gru_input_table.device,
+            tp_size,
+        )
+        cached = getattr(self, "_v5_tp_full_gru_input_table_cache", None)
+        if cached is not None and cached.get("key") == cache_key:
+            return cached["table"]
+
+        required_bytes = (
+            tp_size
+            * int(num_org_padded)
+            * width
+            * local_gru_input_table.element_size()
+        )
+        if mode == "auto" and local_gru_input_table.device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(local_gru_input_table.device)
+            # Keep a modest cushion for verify/draft temporary buffers. The table
+            # is an optimization, so do not risk turning a viable run into OOM.
+            cushion = int(os.environ.get("DFLASH_V5_TP_GRU_TABLE_CUSHION_MB", "1024"))
+            if int(free_bytes) < required_bytes + cushion * 1024 * 1024:
+                if not getattr(self, "_v5_tp_replicate_gru_table_mem_warned", False):
+                    logger.warning(
+                        "DFLASH TP replicated GRU table disabled by auto memory check: "
+                        "need %.2f GiB + %d MiB cushion, free %.2f GiB. "
+                        "Set DFLASH_V5_TP_REPLICATE_GRU_TABLE=1 to force or 0 to silence.",
+                        required_bytes / (1024**3),
+                        cushion,
+                        int(free_bytes) / (1024**3),
+                    )
+                    self._v5_tp_replicate_gru_table_mem_warned = True
+                return None
+
+        full_table = torch.empty(
+            (tp_size * int(num_org_padded), width),
+            dtype=local_gru_input_table.dtype,
+            device=local_gru_input_table.device,
+        )
+        tp_group.all_gather_into_tensor(full_table, local_org_table)
+        self._v5_tp_full_gru_input_table_cache = {
+            "key": cache_key,
+            "table": full_table,
+        }
+        if not getattr(self, "_v5_tp_replicate_gru_table_logged", False):
+            logger.info(
+                "DFLASH TP replicated GRU input table enabled. shape=%s, memory=%.2f GiB",
+                tuple(full_table.shape),
+                required_bytes / (1024**3),
+            )
+            self._v5_tp_replicate_gru_table_logged = True
+        return full_table
+
+    def _v5_lookup_gru_input_proj_full(
+        self,
+        *,
+        token_ids: torch.Tensor,
+        full_gru_input_table: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_ids = token_ids.to(torch.long).reshape(-1)
+        gi = torch.index_select(full_gru_input_table, 0, flat_ids).contiguous()
+        return gi.view(*token_ids.shape, full_gru_input_table.shape[-1])
 
     def _v5_lookup_gru_input_proj_tp(
         self,
@@ -1149,6 +1888,24 @@ class DFlashWorker:
 
         G = int(state["gru_hidden_size"])
         gh = torch.nn.functional.linear(gru_h, state["w_hh"], state["b_hh"])
+        r = torch.sigmoid(gi[:, :G] + gh[:, :G])
+        z_gate = torch.sigmoid(gi[:, G : 2 * G] + gh[:, G : 2 * G])
+        n = torch.tanh(gi[:, 2 * G :] + r * gh[:, 2 * G :])
+        return (1.0 - z_gate) * n + z_gate * gru_h
+
+    def _v5_manual_gru_step_from_projections(
+        self,
+        *,
+        gi: torch.Tensor,
+        gh: torch.Tensor,
+        gru_h: torch.Tensor,
+        state: dict,
+    ) -> torch.Tensor:
+        """Run one GRU step when both input and hidden projections are ready."""
+
+        if state["b_hh"] is not None:
+            gh = gh + state["b_hh"]
+        G = int(state["gru_hidden_size"])
         r = torch.sigmoid(gi[:, :G] + gh[:, :G])
         z_gate = torch.sigmoid(gi[:, G : 2 * G] + gh[:, G : 2 * G])
         n = torch.tanh(gi[:, 2 * G :] + r * gh[:, 2 * G :])
@@ -1758,6 +2515,7 @@ class DFlashWorker:
             )
         org_vocab_start = int(shard.org_vocab_start_index)
         num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
         if num_org <= 0:
             raise RuntimeError("DFLASH lm_head has empty base vocab shard.")
 
@@ -1858,6 +2616,7 @@ class DFlashWorker:
                 lm_head=lm_head,
                 org_vocab_start=org_vocab_start,
                 num_org=num_org,
+                num_org_padded=num_org_padded,
                 state=state,
             )
 

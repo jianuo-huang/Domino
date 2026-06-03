@@ -236,6 +236,43 @@ def _v5_reduce_argmax_kernel(
     tl.store(final_token_ptr + pid_b * stride_final_b, best_idx)
 
 
+@triton.jit
+def _v5_reduce_argmax_with_value_kernel(
+    out_val_ptr, out_idx_ptr, final_token_ptr, final_value_ptr,
+    N,
+    stride_val_b, stride_val_n,
+    stride_idx_b, stride_idx_n,
+    stride_final_b,
+    stride_final_value_b,
+    BLOCK_N: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    best_val = -float("inf")
+    best_idx = 0
+
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+
+        vals = tl.load(
+            out_val_ptr + pid_b * stride_val_b + offs_n * stride_val_n,
+            mask=mask_n, other=-float("inf"),
+        )
+        local_pos = tl.argmax(vals, axis=0)
+        local_val = tl.max(vals, axis=0)
+        local_idx = tl.load(
+            out_idx_ptr + pid_b * stride_idx_b
+            + (start_n + local_pos) * stride_idx_n
+        )
+
+        take = local_val > best_val
+        best_val = tl.where(take, local_val, best_val)
+        best_idx = tl.where(take, local_idx, best_idx)
+
+    tl.store(final_token_ptr + pid_b * stride_final_b, best_idx)
+    tl.store(final_value_ptr + pid_b * stride_final_value_b, best_val)
+
+
 
 @triton.jit
 def _v5_fused_silu_fc2_candidate_argmax_kernel(
@@ -549,6 +586,59 @@ def fused_silu_fc2_argmax(
         _profile_events[1].record()
 
 
+def fused_silu_fc2_argmax_with_value(
+    *,
+    z_proj: torch.Tensor,        # [B, M]
+    s_proj: torch.Tensor,        # [B, M]
+    fc2_weight: torch.Tensor,    # [V, M]
+    fc2_bias: torch.Tensor | None,  # [V] or None
+    base_logits: torch.Tensor,   # [B, V]
+    out_val: torch.Tensor,       # [B, num_v_blocks] fp32 scratch
+    out_idx: torch.Tensor,       # [B, num_v_blocks] int32 scratch
+    final_token: torch.Tensor,   # [B] int64 destination, local vocab ids
+    final_value: torch.Tensor,   # [B] fp32 destination, local max values
+    block_v: int = 512,
+    block_m: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
+) -> None:
+    """Fused full-shard scoring that also returns the local max score."""
+    B, M = z_proj.shape
+    V = base_logits.shape[1]
+    num_v_blocks = (V + block_v - 1) // block_v
+    has_fc2_bias = fc2_bias is not None
+    fc2_bias_arg = fc2_bias if has_fc2_bias else out_val
+
+    grid_main = (num_v_blocks, B)
+    _v5_fused_silu_fc2_argmax_kernel[grid_main](
+        z_proj, s_proj,
+        fc2_weight, base_logits, fc2_bias_arg,
+        out_val, out_idx,
+        M, V,
+        z_proj.stride(0), z_proj.stride(1),
+        s_proj.stride(0), s_proj.stride(1),
+        fc2_weight.stride(0), fc2_weight.stride(1),
+        base_logits.stride(0), base_logits.stride(1),
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        BLOCK_V=block_v,
+        BLOCK_M=block_m,
+        HAS_FC2_BIAS=has_fc2_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    _v5_reduce_argmax_with_value_kernel[(B,)](
+        out_val, out_idx, final_token, final_value,
+        num_v_blocks,
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        final_token.stride(0),
+        final_value.stride(0),
+        BLOCK_N=512,
+        num_warps=1,
+    )
+
 
 def fused_silu_fc2_candidate_argmax(
     *,
@@ -614,6 +704,63 @@ def fused_silu_fc2_candidate_argmax(
     if _profile_events is not None:
         _profile_events[1] = torch.cuda.Event(enable_timing=True)
         _profile_events[1].record()
+
+
+def fused_silu_fc2_candidate_argmax_with_value(
+    *,
+    z_proj: torch.Tensor,        # [B, M]
+    s_proj: torch.Tensor,        # [B, M]
+    fc2_weight: torch.Tensor,    # [V, M]
+    fc2_bias: torch.Tensor | None,  # [V] or None
+    base_logits: torch.Tensor,   # [B, V]
+    candidate_ids: torch.Tensor, # [B, C] local vocab ids into fc2/base_logits
+    out_val: torch.Tensor,       # [B, num_candidate_blocks] fp32 scratch
+    out_idx: torch.Tensor,       # [B, num_candidate_blocks] int32 scratch
+    final_token: torch.Tensor,   # [B] int64 destination, local vocab ids
+    final_value: torch.Tensor,   # [B] fp32 destination, local max values
+    block_c: int = 512,
+    block_m: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
+) -> None:
+    """Candidate-restricted fused scoring that also returns the local max score."""
+    B, M = z_proj.shape
+    V = base_logits.shape[1]
+    C = candidate_ids.shape[1]
+    num_c_blocks = (C + block_c - 1) // block_c
+    has_fc2_bias = fc2_bias is not None
+    fc2_bias_arg = fc2_bias if has_fc2_bias else out_val
+
+    grid_main = (num_c_blocks, B)
+    _v5_fused_silu_fc2_candidate_argmax_kernel[grid_main](
+        z_proj, s_proj,
+        fc2_weight, base_logits, fc2_bias_arg, candidate_ids,
+        out_val, out_idx,
+        M, V, C,
+        z_proj.stride(0), z_proj.stride(1),
+        s_proj.stride(0), s_proj.stride(1),
+        fc2_weight.stride(0), fc2_weight.stride(1),
+        base_logits.stride(0), base_logits.stride(1),
+        candidate_ids.stride(0), candidate_ids.stride(1),
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        BLOCK_C=block_c,
+        BLOCK_M=block_m,
+        HAS_FC2_BIAS=has_fc2_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    _v5_reduce_argmax_with_value_kernel[(B,)](
+        out_val, out_idx, final_token, final_value,
+        num_c_blocks,
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        final_token.stride(0),
+        final_value.stride(0),
+        BLOCK_N=512,
+        num_warps=1,
+    )
 
 
 def fused_gru_cell(
