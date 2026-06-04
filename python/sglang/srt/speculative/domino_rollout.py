@@ -119,30 +119,16 @@ class DFlashDominoRollout:
             )
         out[:, 0].copy_(slot_1)
 
-        prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
-        if full_gru_input_table is not None:
-            prefix_gi = self._domino_lookup_gru_input_proj_full(
-                token_ids=prefix_ids,
-                full_gru_input_table=full_gru_input_table,
-            )
-        else:
-            prefix_gi = self._domino_lookup_gru_input_proj_tp(
-                token_ids=prefix_ids,
-                local_gru_input_table=gru_input_table,
-                org_vocab_start=org_vocab_start,
-                num_org=num_org,
-            )
-        gru_h = torch.zeros(
-            (bs, int(state["gru_hidden_size"])),
-            dtype=prefix_gi.dtype,
+        gru_h = self._init_domino_prefix_gru_hidden(
+            prefix_ids=torch.stack([verified_id.to(torch.long), slot_1], dim=1),
+            z_dtype=z.dtype,
             device=device,
+            state=state,
+            full_gru_input_table=full_gru_input_table,
+            local_gru_input_table=gru_input_table,
+            org_vocab_start=org_vocab_start,
+            num_org=num_org,
         )
-        for t_idx in range(int(prefix_ids.shape[1])):
-            gru_h = self._domino_manual_gru_step_from_input_proj(
-                gi=prefix_gi[:, t_idx, :],
-                gru_h=gru_h,
-                state=state,
-            )
 
         z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
         if use_replicated_scorer:
@@ -656,6 +642,57 @@ class DFlashDominoRollout:
         global_gi = get_tp_group().all_reduce(local_gi)
         return global_gi.view(*token_ids.shape, local_gru_input_table.shape[-1])
 
+    def _init_domino_prefix_gru_hidden(
+        self,
+        *,
+        prefix_ids: torch.Tensor,
+        z_dtype: torch.dtype,
+        device: torch.device,
+        state: dict,
+        embed_module=None,
+        full_gru_input_table: Optional[torch.Tensor] = None,
+        local_gru_input_table: Optional[torch.Tensor] = None,
+        org_vocab_start: int = 0,
+        num_org: int = 0,
+    ) -> torch.Tensor:
+        """Initialize the Domino prefix GRU state from [verified, first draft]."""
+
+        if full_gru_input_table is None and local_gru_input_table is None:
+            if embed_module is None:
+                raise RuntimeError(
+                    "DFLASH Domino prefix init requires embeddings or a GRU input table."
+                )
+            prefix_embeds = embed_module(prefix_ids).to(z_dtype)
+            return self.domino_helper.init_gru_hidden(prefix_embeds)
+
+        if full_gru_input_table is not None:
+            prefix_gi = self._domino_lookup_gru_input_proj_full(
+                token_ids=prefix_ids,
+                full_gru_input_table=full_gru_input_table,
+            )
+        else:
+            if local_gru_input_table is None:
+                raise RuntimeError("DFLASH Domino prefix init missing local GRU table.")
+            prefix_gi = self._domino_lookup_gru_input_proj_tp(
+                token_ids=prefix_ids,
+                local_gru_input_table=local_gru_input_table,
+                org_vocab_start=org_vocab_start,
+                num_org=num_org,
+            )
+
+        gru_h = torch.zeros(
+            (int(prefix_ids.shape[0]), int(state["gru_hidden_size"])),
+            dtype=prefix_gi.dtype,
+            device=device,
+        )
+        for t_idx in range(int(prefix_ids.shape[1])):
+            gru_h = self._domino_manual_gru_step_from_input_proj(
+                gi=prefix_gi[:, t_idx, :],
+                gru_h=gru_h,
+                state=state,
+            )
+        return gru_h
+
     def _domino_manual_gru_step_from_input_proj(
         self,
         *,
@@ -1024,9 +1061,13 @@ class DFlashDominoRollout:
         slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
         slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
 
-        prefix_ids = torch.stack([verified_id.to(torch.long), slot_1], dim=1)
-        prefix_embeds = embed_module(prefix_ids).to(z.dtype)
-        gru_h = domino_helper.init_gru_hidden(prefix_embeds)
+        gru_h = self._init_domino_prefix_gru_hidden(
+            prefix_ids=torch.stack([verified_id.to(torch.long), slot_1], dim=1),
+            z_dtype=z.dtype,
+            device=device,
+            state=state,
+            embed_module=embed_module,
+        )
 
         z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
 
