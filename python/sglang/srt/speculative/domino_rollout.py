@@ -224,6 +224,8 @@ class DFlashDominoRollout:
         G = int(state["gru_hidden_size"])
         emb_dim = int(state["w_z"].shape[0])
         w_s_hh_T = state.get("w_s_hh_T", None)
+        use_fused_gru = z.is_cuda and full_gru_input_table is not None
+        gru_h_next = torch.empty_like(gru_h) if use_fused_gru else None
         for k in range(1, num_draft):
             gh = None
             if w_s_hh_T is not None and k + 1 < num_draft:
@@ -345,31 +347,44 @@ class DFlashDominoRollout:
                     )
             out[:, k].copy_(tok)
             if k + 1 < num_draft:
-                if full_gru_input_table is not None:
-                    gi = self._domino_lookup_gru_input_proj_full(
-                        token_ids=tok,
-                        full_gru_input_table=full_gru_input_table,
-                    )
-                else:
-                    gi = self._domino_lookup_gru_input_proj_tp(
-                        token_ids=tok,
-                        local_gru_input_table=gru_input_table,
-                        org_vocab_start=org_vocab_start,
-                        num_org=num_org,
-                    )
-                if gh is None:
-                    gru_h = self._domino_manual_gru_step_from_input_proj(
-                        gi=gi,
-                        gru_h=gru_h,
-                        state=state,
-                    )
-                else:
-                    gru_h = self._domino_manual_gru_step_from_projections(
-                        gi=gi,
+                if use_fused_gru and gh is not None:
+                    assert gru_h_next is not None
+                    assert full_gru_input_table is not None
+                    fused_gru_cell_from_table(
+                        tok_full=tok,
+                        gru_input_table=full_gru_input_table,
                         gh=gh,
-                        gru_h=gru_h,
-                        state=state,
+                        gh_bias=state["b_hh"],
+                        h_state=gru_h,
+                        h_out=gru_h_next,
                     )
+                    gru_h, gru_h_next = gru_h_next, gru_h
+                else:
+                    if full_gru_input_table is not None:
+                        gi = self._domino_lookup_gru_input_proj_full(
+                            token_ids=tok,
+                            full_gru_input_table=full_gru_input_table,
+                        )
+                    else:
+                        gi = self._domino_lookup_gru_input_proj_tp(
+                            token_ids=tok,
+                            local_gru_input_table=gru_input_table,
+                            org_vocab_start=org_vocab_start,
+                            num_org=num_org,
+                        )
+                    if gh is None:
+                        gru_h = self._domino_manual_gru_step_from_input_proj(
+                            gi=gi,
+                            gru_h=gru_h,
+                            state=state,
+                        )
+                    else:
+                        gru_h = self._domino_manual_gru_step_from_projections(
+                            gi=gi,
+                            gh=gh,
+                            gru_h=gru_h,
+                            state=state,
+                        )
 
         return out
 
