@@ -1015,11 +1015,6 @@ class DFlashDominoRollout:
         if num_org <= 0:
             raise RuntimeError("DFLASH lm_head has empty base vocab shard.")
 
-        candidate_pool_size = self._resolve_domino_candidate_pool_size(
-            num_org,
-            warn_on_disable=True,
-        )
-
         draft_model = self.domino_helper.draft_model
         embed_module = target_model.get_input_embeddings()
         domino_helper = self.domino_helper
@@ -1048,6 +1043,11 @@ class DFlashDominoRollout:
                 num_org_padded=num_org_padded,
                 state=state,
             )
+
+        candidate_pool_size = self._resolve_domino_candidate_pool_size(
+            num_org,
+            warn_on_disable=True,
+        )
 
         G = state["gru_hidden_size"]
         emb_dim = int(state["w_z"].shape[0])
