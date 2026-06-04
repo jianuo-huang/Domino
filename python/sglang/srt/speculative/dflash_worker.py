@@ -25,6 +25,7 @@ from sglang.srt.speculative.domino_helper import DFlashDominoHelper
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    is_dflash_domino_projector,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
@@ -163,8 +164,9 @@ class DFlashWorker:
         self.draft_model = self.draft_model_runner.model
         self.domino_helper: Optional[DFlashDominoHelper] = (
             DFlashDominoHelper(self.draft_model)
-            if getattr(self.draft_model, "projector_type", None)
-            in {"domino", "causal_v5"}
+            if is_dflash_domino_projector(
+                getattr(self.draft_model, "projector_type", None)
+            )
             else None
         )
         self.domino_rollout: Optional[DFlashDominoRollout] = None
@@ -700,7 +702,9 @@ class DFlashWorker:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
-        if getattr(self.draft_model, "projector_type", None) in {"domino", "causal_v5"}:
+        if is_dflash_domino_projector(
+            getattr(self.draft_model, "projector_type", None)
+        ):
             if self.domino_rollout is None:
                 raise RuntimeError(
                     "DFLASH Domino projector requires an initialized Domino rollout."

@@ -27,8 +27,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
-    _DFLASH_DOMINO_PROJECTORS,
     can_dflash_slice_qkv_weight,
+    is_dflash_domino_projector,
     parse_dflash_draft_config,
 )
 
@@ -302,7 +302,7 @@ class DFlashDraftModel(nn.Module):
         self.gru_hidden_dim: Optional[int] = draft_config.gru_hidden_dim
         self.emb_dim: Optional[int] = draft_config.emb_dim
 
-        if self.projector_type in _DFLASH_DOMINO_PROJECTORS:
+        if is_dflash_domino_projector(self.projector_type):
             if self.gru_hidden_dim is None or self.emb_dim is None:
                 raise ValueError(
                     "DFLASH Domino requires gru_hidden_dim and emb_dim. "

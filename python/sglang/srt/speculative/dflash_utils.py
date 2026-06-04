@@ -16,7 +16,9 @@ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 # checkpoints use projector_type="domino" for the GRU-prefix + MLP bias path.
 # Keep causal_v5 as a backward-compatible alias for older internal checkpoints.
 _DFLASH_DOMINO_PROJECTORS = frozenset({"domino", "causal_v5"})
-_DFLASH_SUPPORTED_PROJECTORS: frozenset[Optional[str]] = frozenset({None, *_DFLASH_DOMINO_PROJECTORS})
+_DFLASH_SUPPORTED_PROJECTORS: frozenset[Optional[str]] = frozenset(
+    {None, *_DFLASH_DOMINO_PROJECTORS}
+)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -29,6 +31,10 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TRTLLMMLABackend",
     }
 )
+
+
+def is_dflash_domino_projector(projector_type: Optional[str]) -> bool:
+    return projector_type in _DFLASH_DOMINO_PROJECTORS
 
 
 if is_cuda() or is_musa():
@@ -439,7 +445,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         )
     shift_label = bool(shift_label_raw)
 
-    if projector_type in _DFLASH_DOMINO_PROJECTORS:
+    if is_dflash_domino_projector(projector_type):
         if gru_hidden_dim is None:
             raise ValueError(
                 "DFLASH Domino requires dflash_config.gru_hidden_dim to be set."

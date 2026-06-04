@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.speculative.dflash_utils import _DFLASH_DOMINO_PROJECTORS
+from sglang.srt.speculative.dflash_utils import is_dflash_domino_projector
 
 
 class DFlashDominoHelper:
@@ -19,9 +19,8 @@ class DFlashDominoHelper:
         self._gru_input_table_cache = None
 
     def _check_projector(self) -> None:
-        if (
+        if not is_dflash_domino_projector(
             getattr(self.draft_model, "projector_type", None)
-            not in _DFLASH_DOMINO_PROJECTORS
         ):
             raise RuntimeError("Domino helper called on a non-Domino draft model.")
         if not hasattr(self.draft_model, "prefix_gru") or not hasattr(
