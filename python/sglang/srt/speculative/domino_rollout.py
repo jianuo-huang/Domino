@@ -132,34 +132,21 @@ class DFlashDominoRollout:
 
         z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
         if use_replicated_scorer:
-            fc2_w = state["fc2_weight"][:valid_vocab_size].contiguous()
-            fc2_b = (
-                state["fc2_bias"][:valid_vocab_size].contiguous()
-                if state["fc2_bias"] is not None
-                else None
+            fc2_w, fc2_b = self._slice_domino_fc2(
+                state=state,
+                start=0,
+                length=valid_vocab_size,
             )
         else:
-            fc2_w = state["fc2_weight"][
-                org_vocab_start : org_vocab_start + num_org
-            ].contiguous()
-            fc2_b = (
-                state["fc2_bias"][
-                    org_vocab_start : org_vocab_start + num_org
-                ].contiguous()
-                if state["fc2_bias"] is not None
-                else None
+            fc2_w, fc2_b = self._slice_domino_fc2(
+                state=state,
+                start=org_vocab_start,
+                length=num_org,
             )
-        candidate_pool_size = max(
-            0,
-            int(
-                os.environ.get(
-                    "DFLASH_DOMINO_CANDIDATE_POOL",
-                    str(_DOMINO_CANDIDATE_POOL_SIZE),
-                )
-            ),
+        candidate_pool_size = self._resolve_domino_candidate_pool_size(
+            score_vocab_size,
+            warn_on_disable=False,
         )
-        if candidate_pool_size > 0 and candidate_pool_size >= score_vocab_size:
-            candidate_pool_size = 0
         use_fused_score = z.is_cuda
         candidate_ids = None
         candidate_token_ids = None
@@ -642,6 +629,51 @@ class DFlashDominoRollout:
         global_gi = get_tp_group().all_reduce(local_gi)
         return global_gi.view(*token_ids.shape, local_gru_input_table.shape[-1])
 
+    def _resolve_domino_candidate_pool_size(
+        self,
+        vocab_size: int,
+        *,
+        warn_on_disable: bool,
+    ) -> int:
+        candidate_pool_size = max(
+            0,
+            int(
+                os.environ.get(
+                    "DFLASH_DOMINO_CANDIDATE_POOL",
+                    str(_DOMINO_CANDIDATE_POOL_SIZE),
+                )
+            ),
+        )
+        if candidate_pool_size > 0 and candidate_pool_size >= int(vocab_size):
+            if warn_on_disable and not getattr(
+                self, "_domino_candidate_full_vocab_warned", False
+            ):
+                logger.warning(
+                    "DFLASH_DOMINO_CANDIDATE_POOL=%d is >= local vocab size %d; "
+                    "using full-vocab Domino scoring instead.",
+                    candidate_pool_size,
+                    int(vocab_size),
+                )
+                self._domino_candidate_full_vocab_warned = True
+            candidate_pool_size = 0
+        return candidate_pool_size
+
+    def _slice_domino_fc2(
+        self,
+        *,
+        state: dict,
+        start: int,
+        length: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        end = int(start) + int(length)
+        fc2_w = state["fc2_weight"][int(start) : end].contiguous()
+        fc2_b = (
+            state["fc2_bias"][int(start) : end].contiguous()
+            if state["fc2_bias"] is not None
+            else None
+        )
+        return fc2_w, fc2_b
+
     def _init_domino_prefix_gru_hidden(
         self,
         *,
@@ -811,13 +843,10 @@ class DFlashDominoRollout:
         if candidate_ids_buf is not None:
             candidate_ids_buf.zero_()
         local_tok_buf = torch.empty((bs,), dtype=torch.long, device=device)
-        fc2_w_shard = state["fc2_weight"][
-            org_vocab_start : org_vocab_start + num_org
-        ].contiguous()
-        fc2_b_shard = (
-            state["fc2_bias"][org_vocab_start : org_vocab_start + num_org].contiguous()
-            if state["fc2_bias"] is not None
-            else None
+        fc2_w_shard, fc2_b_shard = self._slice_domino_fc2(
+            state=state,
+            start=org_vocab_start,
+            length=num_org,
         )
         b_hh_static = state["b_hh"]
 
@@ -986,24 +1015,10 @@ class DFlashDominoRollout:
         if num_org <= 0:
             raise RuntimeError("DFLASH lm_head has empty base vocab shard.")
 
-        candidate_pool_size = max(
-            0,
-            int(
-                os.environ.get(
-                    "DFLASH_DOMINO_CANDIDATE_POOL",
-                    str(_DOMINO_CANDIDATE_POOL_SIZE),
-                )
-            ),
+        candidate_pool_size = self._resolve_domino_candidate_pool_size(
+            num_org,
+            warn_on_disable=True,
         )
-        if candidate_pool_size > 0 and candidate_pool_size >= num_org:
-            if not getattr(self, "_domino_candidate_full_vocab_warned", False):
-                logger.warning(
-                    "DFLASH_DOMINO_CANDIDATE_POOL=%d is >= local vocab size %d; "
-                    "using full-vocab Domino scoring instead.",
-                    candidate_pool_size, num_org,
-                )
-                self._domino_candidate_full_vocab_warned = True
-            candidate_pool_size = 0
 
         draft_model = self.domino_helper.draft_model
         embed_module = target_model.get_input_embeddings()
