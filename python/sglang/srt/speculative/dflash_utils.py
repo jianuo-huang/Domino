@@ -415,14 +415,18 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"supported={sorted(p for p in _DFLASH_SUPPORTED_PROJECTORS if p is not None)}."
             )
 
-    # v5 fields. emb_dim is top-level on the HF config (not inside dflash_config).
+    # v5 fields. Public/SpecForge checkpoints may store emb_dim either at the
+    # HF config top level or inside dflash_config.
     gru_hidden_dim = _parse_optional_int(
         dflash_cfg.get("gru_hidden_dim", None),
         field_name="DFLASH dflash_config.gru_hidden_dim",
         min_value=1,
     )
+    emb_dim_raw = _cfg_get(draft_text_config, "emb_dim", None)
+    if emb_dim_raw is None:
+        emb_dim_raw = dflash_cfg.get("emb_dim", None)
     emb_dim = _parse_optional_int(
-        _cfg_get(draft_text_config, "emb_dim", None),
+        emb_dim_raw,
         field_name="DFLASH emb_dim",
         min_value=1,
     )
@@ -452,7 +456,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             )
         if emb_dim is None:
             raise ValueError(
-                "DFLASH Domino requires top-level config.emb_dim to be set."
+                "DFLASH Domino requires config.emb_dim or "
+                "dflash_config.emb_dim to be set."
             )
         # The current SGLang adapter supports both shift_label=True and
         # shift_label=False Domino/causal_v5 alignment, while still assuming the
