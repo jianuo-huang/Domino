@@ -9,7 +9,7 @@ Domino is a speculative decoding method that keeps draft generation block-parall
 
 ## News
 
-- [2026-05-30] 🔥🔥 Domino training code released! The training implementation is now available in SpecForge via [sgl-project/SpecForge#571](https://github.com/sgl-project/SpecForge/pull/571).
+- [2026-05-30] 🔥🔥 Domino training code is now available in [SpecForge](https://github.com/sgl-project/SpecForge).
 - [2026-05-29] 🔥 Domino paper released! Read the paper on [arXiv](https://arxiv.org/abs/2605.29707).
 
 ## Demo
@@ -20,8 +20,10 @@ Domino is a speculative decoding method that keeps draft generation block-parall
 
 | Target model | Draft model |
 | --- | --- |
-| `Qwen/Qwen3-4B` | [`Huang2020/Qwen3-4B-Domino-b16`](https://huggingface.co/Huang2020/Qwen3-4B-Domino-b16) |
-| `Qwen/Qwen3-8B` | [`Huang2020/Qwen3-8B-Domino-b16`](https://huggingface.co/Huang2020/Qwen3-8B-Domino-b16) |
+| `Qwen3-4B` | [`Qwen3-4B-Domino-b16`](https://huggingface.co/Huang2020/Qwen3-4B-Domino-b16) |
+| `Qwen3-8B` | [`Qwen3-8B-Domino-b16`](https://huggingface.co/Huang2020/Qwen3-8B-Domino-b16) |
+| `Qwen3.6-35B-A3B` | Coming soon |
+| `Qwen3.6-27B` | Coming soon |
 
 ## Installation
 
