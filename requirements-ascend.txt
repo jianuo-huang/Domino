@@ -1,0 +1,27 @@
+# Ascend MVP runtime: CANN 8.0.1 + Python 3.10.
+# CUDA-only dependencies (Triton, FlashAttention, and SGLang) are intentionally
+# excluded from this environment.
+
+torch==2.4.0
+torch-npu==2.4.0.post2
+transformers==4.51.3
+datasets==3.6.0
+accelerate==1.6.0
+
+numpy==1.26.4
+huggingface-hub==0.31.4
+safetensors==0.5.3
+tqdm==4.67.1
+rich==13.9.4
+loguru==0.7.3
+typing-extensions==4.12.2
+pytest==8.3.5
+
+# Required by torch_npu/CANN and the Transformers NPU integration.
+decorator==5.2.1
+cloudpickle==3.1.2
+ml-dtypes==0.5.3
+scipy==1.15.3
+tornado==6.5.4
+absl-py==2.3.1
+einops==0.8.1
