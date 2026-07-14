@@ -27,12 +27,73 @@ Domino is a speculative decoding method that keeps draft generation block-parall
 
 ## Installation
 
-### Ascend MVP
+### CUDA
 
-The Ascend MVP targets an eight-card Ascend 910B4 server with CANN 8.0.1. It
-uses the eager PyTorch/SDPA path through `torch_npu`; Triton, CUDA Graph,
-NPUGraph, FlashAttention, SGLang, and custom AscendC kernels are not part of
-this first migration stage.
+Use Python 3.10 or newer on a CUDA GPU machine. Install a PyTorch build that matches your CUDA driver, then install the remaining Hugging Face benchmark dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements-hf.txt
+```
+
+For the SGLang benchmark, install the extra build tools first. On Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential ninja-build protobuf-compiler
+```
+
+The SGLang branch also builds a Rust component. Install Rust if `cargo` is not already available:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+Then install the Domino-compatible SGLang branch in the same Python environment:
+
+```bash
+git clone --branch sglang-feat/dflash-domino https://github.com/jianuo-huang/Domino.git sglang-domino
+cd sglang-domino
+python -m pip install -e ./python
+python -m pip install --force-reinstall --no-deps sglang-kernel \
+  --index-url https://docs.sglang.ai/whl/cu130/
+cd -
+```
+
+This SGLang branch currently resolves to PyTorch 2.11 CUDA 13 wheels. Use the matching SGLang kernel wheel above, and verify that your NVIDIA driver is new enough for CUDA 13 runtime libraries.
+
+For CUDA 12.8 / PyTorch 2.9, patch the SGLang dependency pins before installing:
+
+```bash
+git clone --branch sglang-feat/dflash-domino https://github.com/jianuo-huang/Domino.git sglang-domino
+cd sglang-domino
+
+python -m pip install --upgrade pip
+
+sed -i \
+  -e 's/"torch==2.11.0"/"torch==2.9.1+cu128"/' \
+  -e 's/"torchaudio==2.11.0"/"torchaudio==2.9.1+cu128"/' \
+  -e 's/"torchvision"/"torchvision==0.24.1+cu128"/' \
+  -e 's/"kernels"/"kernels==0.14.1"/' \
+  -e '/"sglang-kernel==0.4.2"/d' \
+  python/pyproject.toml
+
+python -m pip install \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  -e ./python
+python -m pip install --force-reinstall --no-deps "${SGLANG_KERNEL_CU12_WHEEL}"
+cd -
+```
+
+Set `SGLANG_KERNEL_CU12_WHEEL` to a CUDA-12-compatible `sglang-kernel` wheel before running the last command. Do not install the `cu130` wheel in a PyTorch 2.9/cu128 environment.
+
+### Initial Ascend Support
+
+The initial Ascend implementation targets an eight-card Ascend 910B4 server
+with CANN 8.0.1. It uses the eager PyTorch/SDPA path through `torch_npu`;
+Triton, CUDA Graph, NPUGraph, FlashAttention, SGLang, and custom AscendC kernels
+are not part of this first migration stage.
 
 Create a clean, standalone Conda environment before running or modifying the
 Ascend path:
@@ -117,67 +178,6 @@ default). Run the full Qwen3-8B benchmark with:
 ```bash
 ./run_ascend_benchmark.sh
 ```
-
-### CUDA
-
-Use Python 3.10 or newer on a CUDA GPU machine. Install a PyTorch build that matches your CUDA driver, then install the remaining Hugging Face benchmark dependencies:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -r requirements-hf.txt
-```
-
-For the SGLang benchmark, install the extra build tools first. On Ubuntu:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential ninja-build protobuf-compiler
-```
-
-The SGLang branch also builds a Rust component. Install Rust if `cargo` is not already available:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-```
-
-Then install the Domino-compatible SGLang branch in the same Python environment:
-
-```bash
-git clone --branch sglang-feat/dflash-domino https://github.com/jianuo-huang/Domino.git sglang-domino
-cd sglang-domino
-python -m pip install -e ./python
-python -m pip install --force-reinstall --no-deps sglang-kernel \
-  --index-url https://docs.sglang.ai/whl/cu130/
-cd -
-```
-
-This SGLang branch currently resolves to PyTorch 2.11 CUDA 13 wheels. Use the matching SGLang kernel wheel above, and verify that your NVIDIA driver is new enough for CUDA 13 runtime libraries.
-
-For CUDA 12.8 / PyTorch 2.9, patch the SGLang dependency pins before installing:
-
-```bash
-git clone --branch sglang-feat/dflash-domino https://github.com/jianuo-huang/Domino.git sglang-domino
-cd sglang-domino
-
-python -m pip install --upgrade pip
-
-sed -i \
-  -e 's/"torch==2.11.0"/"torch==2.9.1+cu128"/' \
-  -e 's/"torchaudio==2.11.0"/"torchaudio==2.9.1+cu128"/' \
-  -e 's/"torchvision"/"torchvision==0.24.1+cu128"/' \
-  -e 's/"kernels"/"kernels==0.14.1"/' \
-  -e '/"sglang-kernel==0.4.2"/d' \
-  python/pyproject.toml
-
-python -m pip install \
-  --extra-index-url https://download.pytorch.org/whl/cu128 \
-  -e ./python
-python -m pip install --force-reinstall --no-deps "${SGLANG_KERNEL_CU12_WHEEL}"
-cd -
-```
-
-Set `SGLANG_KERNEL_CU12_WHEEL` to a CUDA-12-compatible `sglang-kernel` wheel before running the last command. Do not install the `cu130` wheel in a PyTorch 2.9/cu128 environment.
 
 ## Quick Usage
 
