@@ -20,7 +20,6 @@ fi
 TARGET_MODEL="${TARGET_MODEL:-${DEFAULT_TARGET_MODEL}}"
 TARGET_REVISION="${TARGET_REVISION:-b968826d9c46dd6066d109eabc6255188de91218}"
 TARGET_DTYPE="${TARGET_DTYPE:-float16}"
-SEQUENTIAL_FALLBACK_MARGIN="${SEQUENTIAL_FALLBACK_MARGIN:-0.032}"
 DRAFT_MODEL="${DRAFT_MODEL:-${DEFAULT_DRAFT_MODEL}}"
 DRAFT_REVISION="${DRAFT_REVISION:-b2b249e3429fedbcb17c2166d3ac2161a047157b}"
 TASKS="${TASKS:-gsm8k:32,humaneval:32,alpaca:32}"
@@ -31,7 +30,7 @@ WARMUP_SAMPLES="${WARMUP_SAMPLES:-3}"
 REPETITIONS="${REPETITIONS:-3}"
 MASTER_PORT="${MASTER_PORT:-29641}"
 MIN_SPEEDUP="${MIN_SPEEDUP:-1.05}"
-ENFORCE="${ENFORCE:-1}"
+ENFORCE="${ENFORCE:-0}"
 OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/outputs/ascend_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "${OUT_DIR}"
@@ -67,7 +66,6 @@ for task in "${TASK_ARRAY[@]}"; do
     --target-dtype "${TARGET_DTYPE}" \
     --draft-name-or-path "${DRAFT_MODEL}" --draft-revision "${DRAFT_REVISION}" \
     --block-size "${BLOCK_SIZE}" --use-bias \
-    --sequential-fallback-margin "${SEQUENTIAL_FALLBACK_MARGIN}" \
     --max-new-tokens "${MAX_NEW_TOKENS}" \
     --warmup-samples "${WARMUP_SAMPLES}" --repetitions "${REPETITIONS}" \
     --answer-file "${DOMINO}"

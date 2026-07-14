@@ -45,21 +45,6 @@ def device_time(device: torch.device | str | int | None = None) -> float:
     return time.perf_counter()
 
 
-def clone_dynamic_cache(cache: DynamicCache) -> DynamicCache:
-    """Clone a Transformers 4.51 DynamicCache without sharing tensor storage.
-
-    Domino keeps an exact, sequential-only checkpoint beside the cache used by
-    block verification.  A shallow copy is insufficient because cache updates
-    and NPU kernels may mutate tensors owned by the block path.
-    """
-
-    cloned = DynamicCache()
-    cloned._seen_tokens = cache._seen_tokens
-    cloned.key_cache = [key.clone() for key in cache.key_cache]
-    cloned.value_cache = [value.clone() for value in cache.value_cache]
-    return cloned
-
-
 def manual_gru(
     gru: nn.GRU,
     inputs: torch.Tensor,
@@ -231,8 +216,6 @@ def target_greedy_generate(
         total_wall_time=total_end - total_start,
         peak_memory_mb=max_memory_allocated_mb(device),
         acceptance_lengths=[],
-        sequential_fallbacks=0,
-        sequential_catchup_mismatches=0,
     )
 
 
@@ -499,7 +482,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         block_size: Optional[int] = None,
         graph_runner=None,
         use_bias: bool = True,
-        sequential_fallback_margin: Optional[float] = None,
         return_dict: bool = False,
     ) -> torch.Tensor | SimpleNamespace:
         """Generate with Domino speculative decoding.
@@ -510,16 +492,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(
                 "spec_generate currently supports input_ids with shape [1, seq_len]."
-            )
-
-        fallback_enabled = (
-            sequential_fallback_margin is not None
-            and sequential_fallback_margin >= 0
-        )
-        if fallback_enabled and temperature >= 1e-5:
-            raise ValueError(
-                "sequential_fallback_margin is only supported for greedy "
-                "generation (temperature=0)."
             )
 
         target_device = next(target.parameters()).device
@@ -569,14 +541,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output_hidden_states=block_size > 1,
         )
 
-        if fallback_enabled:
-            # Block verification never owns the sequential checkpoint.  If a
-            # low margin later requires exact replay, this cache can be caught
-            # up without retaining any block-computed KV tensors.
-            exact_cache = past_key_values_target
-            exact_position = num_input_tokens
-            past_key_values_target = clone_dynamic_cache(exact_cache)
-
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits, temperature
@@ -590,8 +554,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         decode_start = device_time(self.device)
         start = num_input_tokens
         acceptance_lengths: list[int] = []
-        sequential_fallbacks = 0
-        sequential_catchup_mismatches = 0
         draft_prefill = True
         draft_setup_time = 0.0
         prefix_len = int(self.pure_draft_prefix_len)
@@ -710,78 +672,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 .sum(dim=1)[0]
                 .item()
             )
-            use_sequential_fallback = False
-            if fallback_enabled and verify_length > 1:
-                relevant_logits = output.logits[:, : acceptance_length + 1, :]
-                top_two = torch.topk(relevant_logits, k=2, dim=-1).values
-                margins = top_two[..., 0] - top_two[..., 1]
-                use_sequential_fallback = bool(
-                    (margins <= sequential_fallback_margin).any().item()
-                )
-
-            sequential_target_hidden = None
-            if use_sequential_fallback:
-                sequential_fallbacks += 1
-                # Discard the active block cache.  First catch the independent
-                # sequential checkpoint up to this round, then reproduce the
-                # ordinary one-token target path from the current token.
-                for position in range(exact_position, start):
-                    catchup_output = target(
-                        output_ids[:, position : position + 1],
-                        position_ids=position_ids[:, position : position + 1],
-                        past_key_values=exact_cache,
-                        use_cache=True,
-                        logits_to_keep=1,
-                        output_hidden_states=False,
-                    )
-                    catchup_posterior = sample(
-                        catchup_output.logits, temperature
-                    )[:, -1:]
-                    if not torch.equal(
-                        catchup_posterior,
-                        output_ids[:, position + 1 : position + 2],
-                    ):
-                        sequential_catchup_mismatches += 1
-
-                sequential_hiddens = []
-                for index in range(verify_length):
-                    sequential_output = target(
-                        round_verify_ids[:, index : index + 1],
-                        position_ids=round_position_ids[:, index : index + 1],
-                        past_key_values=exact_cache,
-                        use_cache=True,
-                        logits_to_keep=1,
-                        output_hidden_states=block_size > 1,
-                    )
-                    sequential_posterior = sample(
-                        sequential_output.logits, temperature
-                    )[:, -1:]
-                    if block_size > 1:
-                        sequential_hiddens.append(
-                            extract_context_feature(
-                                sequential_output.hidden_states,
-                                self.target_layer_ids,
-                            )
-                        )
-
-                    is_bonus = index + 1 == verify_length
-                    is_mismatch = not is_bonus and not torch.equal(
-                        round_verify_ids[:, index + 1 : index + 2],
-                        sequential_posterior,
-                    )
-                    if is_mismatch or is_bonus:
-                        acceptance_length = index
-                        correction = sequential_posterior
-                        break
-
-                if block_size > 1:
-                    sequential_target_hidden = torch.cat(
-                        sequential_hiddens, dim=1
-                    )
-                exact_position = start + int(acceptance_length) + 1
-                past_key_values_target = clone_dynamic_cache(exact_cache)
-            else:
-                correction = posterior[:, acceptance_length : acceptance_length + 1]
+            correction = posterior[:, acceptance_length : acceptance_length + 1]
 
             output_ids[:, start : start + acceptance_length + 1] = round_verify_ids[
                 :, : acceptance_length + 1
@@ -792,12 +683,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             start += int(acceptance_length) + 1
             past_key_values_target.crop(start)
             if block_size > 1:
-                if sequential_target_hidden is not None:
-                    target_hidden = sequential_target_hidden
-                else:
-                    target_hidden = extract_context_feature(
-                        output.hidden_states, self.target_layer_ids
-                    )[:, : acceptance_length + 1, :]
+                target_hidden = extract_context_feature(
+                    output.hidden_states, self.target_layer_ids
+                )[:, : acceptance_length + 1, :]
 
             if stop_token_ids is not None:
                 stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
@@ -845,6 +733,4 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             total_wall_time=total_end - total_start,
             peak_memory_mb=max_memory_allocated_mb(self.device),
             acceptance_lengths=acceptance_lengths,
-            sequential_fallbacks=sequential_fallbacks,
-            sequential_catchup_mismatches=sequential_catchup_mismatches,
         )

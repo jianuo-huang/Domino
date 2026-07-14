@@ -1,3 +1,4 @@
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -200,6 +201,8 @@ def test_target_greedy_generate_stops_at_eos_and_returns_metrics(monkeypatch):
     assert result.total_wall_time == pytest.approx(4.0)
     assert result.peak_memory_mb == pytest.approx(321.5)
     assert result.acceptance_lengths == []
+    assert not hasattr(result, "sequential_fallbacks")
+    assert not hasattr(result, "sequential_catchup_mismatches")
 
 
 def test_spec_generate_stops_when_current_posterior_is_eos():
@@ -232,7 +235,7 @@ def test_spec_generate_does_not_verify_beyond_max_length():
     assert len(target.calls) == 1
 
 
-def test_low_margin_sequential_fallback_matches_target_and_preserves_cache():
+def test_spec_generate_uses_block_verification_by_default():
     input_ids = torch.tensor([[0, 1]])
     expected = dflash.target_greedy_generate(
         input_ids=input_ids,
@@ -240,74 +243,42 @@ def test_low_margin_sequential_fallback_matches_target_and_preserves_cache():
         max_new_tokens=5,
     )
 
-    disabled_target = BatchDivergentTarget()
-    disabled = BatchDivergenceDraft().spec_generate(
-        input_ids=input_ids,
-        target=disabled_target,
-        max_new_tokens=5,
-        sequential_fallback_margin=-1,
-    )
-    assert not torch.equal(disabled, expected)
-
-    enabled_target = BatchDivergentTarget()
-    enabled = BatchDivergenceDraft().spec_generate(
-        input_ids=input_ids,
-        target=enabled_target,
-        max_new_tokens=5,
-        sequential_fallback_margin=0.25,
-        return_dict=True,
-    )
-    assert torch.equal(enabled.output_ids, expected)
-    assert enabled.sequential_fallbacks == 1
-    assert enabled.sequential_catchup_mismatches == 0
-    assert enabled_target.last_cache.get_seq_length() == enabled.output_ids.shape[1] - 1
-
-
-def test_low_margin_fallback_respects_eos_and_rejects_sampling():
     target = BatchDivergentTarget()
-    draft = BatchDivergenceDraft()
-    result = draft.spec_generate(
-        input_ids=torch.tensor([[0, 1]]),
+    result = BatchDivergenceDraft().spec_generate(
+        input_ids=input_ids,
         target=target,
-        max_new_tokens=8,
-        stop_token_ids=5,
-        sequential_fallback_margin=0.25,
+        max_new_tokens=5,
         return_dict=True,
     )
-    assert result.output_ids.tolist() == [[0, 1, 2, 3, 4, 5]]
+    assert not torch.equal(result.output_ids, expected)
     assert target.last_cache.get_seq_length() == result.output_ids.shape[1] - 1
+    assert not hasattr(result, "sequential_fallbacks")
+    assert not hasattr(result, "sequential_catchup_mismatches")
+    assert "sequential_fallback_margin" not in inspect.signature(
+        dflash.DFlashDraftModel.spec_generate
+    ).parameters
 
-    with pytest.raises(ValueError, match="only supported for greedy"):
-        draft.spec_generate(
-            input_ids=torch.tensor([[0, 1]]),
-            target=target,
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        BatchDivergenceDraft().spec_generate(
+            input_ids=input_ids,
+            target=BatchDivergentTarget(),
             max_new_tokens=2,
-            temperature=0.7,
-            sequential_fallback_margin=0.25,
+            sequential_fallback_margin=-1,
         )
 
 
-def test_fp32_target_with_bf16_draft_casts_boundaries_without_exact_cache(
-    monkeypatch,
-):
+def test_fp32_target_with_bf16_draft_casts_boundaries():
     target = BatchDivergentTarget().float()
     draft = BatchDivergenceDraft().to(dtype=torch.bfloat16)
-    monkeypatch.setattr(
-        dflash,
-        "clone_dynamic_cache",
-        lambda cache: pytest.fail("disabled fallback must not clone the target cache"),
-    )
 
     result = draft.spec_generate(
         input_ids=torch.tensor([[0, 1]]),
         target=target,
         max_new_tokens=5,
-        sequential_fallback_margin=-1,
         return_dict=True,
     )
 
     assert result.output_ids.dtype == torch.long
-    assert result.sequential_fallbacks == 0
     assert draft.seen_noise_dtype == torch.bfloat16
     assert draft.seen_target_hidden_dtype == torch.bfloat16
     assert target.lm_head.weight.dtype == torch.float32
@@ -332,6 +303,9 @@ builtins.__import__ = guarded_import
 benchmark = importlib.import_module('benchmark')
 assert benchmark.TARGET_DTYPES['bfloat16'] == __import__('torch').bfloat16
 assert benchmark.TARGET_DTYPES['float32'] == __import__('torch').float32
+choice = benchmark._new_choice(0, 'domino', 16)
+assert 'sequential_fallbacks' not in choice
+assert 'sequential_catchup_mismatches' not in choice
 assert 'kernel.domino' not in sys.modules
 sys.modules.pop('benchmark', None)
 sys.argv = ['benchmark.py', '--help']
@@ -358,5 +332,31 @@ assert 'kernel.domino' not in sys.modules
 
     assert completed.returncode == 0, completed.stderr
     assert "--device-backend" in completed.stdout
+    assert "--sequential-fallback-margin" not in completed.stdout
     assert "--target-dtype" in completed.stdout
     assert "float32" in completed.stdout
+
+
+def test_benchmark_rejects_removed_sequential_fallback_option():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CODE_DIR / "benchmark.py"),
+            "--sequential-fallback-margin",
+            "-1",
+        ],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                [str(CODE_DIR), os.environ.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "unrecognized arguments: --sequential-fallback-margin -1" in completed.stderr

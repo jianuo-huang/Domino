@@ -116,8 +116,6 @@ def _new_choice(index: int, mode: str, block_size: int) -> dict:
         "time_per_output_token": [],
         "peak_memory_mb": [],
         "acceptance_lengths": [],
-        "sequential_fallbacks": [],
-        "sequential_catchup_mismatches": [],
     }
 
 
@@ -153,21 +151,6 @@ def _record_choice(choice, responses, tokenizer) -> str:
     choice["acceptance_lengths"].append(
         [int(value) for value in first.acceptance_lengths]
     )
-    fallback_counts = [int(item.sequential_fallbacks) for item in responses]
-    if len(set(fallback_counts)) != 1:
-        raise RuntimeError(
-            "Repeated deterministic runs produced different sequential fallback counts."
-        )
-    choice["sequential_fallbacks"].append(fallback_counts[0])
-    catchup_mismatches = [
-        int(item.sequential_catchup_mismatches) for item in responses
-    ]
-    if len(set(catchup_mismatches)) != 1:
-        raise RuntimeError(
-            "Repeated deterministic runs produced different sequential catch-up "
-            "mismatch counts."
-        )
-    choice["sequential_catchup_mismatches"].append(catchup_mismatches[0])
     return text
 
 
@@ -243,29 +226,6 @@ def _print_stats(answers: list[dict], block_size: int) -> None:
         ]
         print(f"Acceptance histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
 
-    for mode, mode_choices in by_mode.items():
-        fallback_counts = list(
-            chain.from_iterable(
-                choice["sequential_fallbacks"] for choice in mode_choices
-            )
-        )
-        total_fallbacks = sum(fallback_counts)
-        catchup_mismatches = sum(
-            chain.from_iterable(
-                choice["sequential_catchup_mismatches"]
-                for choice in mode_choices
-            )
-        )
-        average_fallbacks = (
-            total_fallbacks / len(fallback_counts) if fallback_counts else 0.0
-        )
-        print(
-            f"{mode}: sequential_fallbacks_total={total_fallbacks} "
-            f"sequential_fallbacks_per_generation={average_fallbacks:.3f} "
-            f"sequential_catchup_mismatches={catchup_mismatches}"
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, default=None)
@@ -286,15 +246,6 @@ def main() -> None:
         choices=TARGET_DTYPES,
         default="bfloat16",
         help="Target model weight dtype (default: bfloat16); draft remains bfloat16.",
-    )
-    parser.add_argument(
-        "--sequential-fallback-margin",
-        type=float,
-        default=0.25,
-        help=(
-            "Greedy-only top1-top2 target-logit margin that triggers sequential "
-            "block re-verification; set a negative value to disable (default: 0.25)."
-        ),
     )
     parser.add_argument("--warmup-samples", type=int, default=0)
     parser.add_argument("--repetitions", type=int, default=1)
@@ -318,12 +269,6 @@ def main() -> None:
         parser.error("Domino mode requires --draft-name-or-path.")
     if args.repetitions < 1 or args.warmup_samples < 0:
         parser.error("--repetitions must be >=1 and --warmup-samples must be >=0.")
-    if args.sequential_fallback_margin >= 0 and args.temperature >= 1e-5:
-        parser.error(
-            "--sequential-fallback-margin is only supported with --temperature 0; "
-            "set a negative margin to disable it for sampling."
-        )
-
     instances = _load_instances(args)
     if args.dump_benchmark_manifest:
         _dump_manifest(args.dump_benchmark_manifest, instances)
@@ -412,7 +357,6 @@ def main() -> None:
             block_size=block_size,
             graph_runner=graph_runner,
             use_bias=args.use_bias,
-            sequential_fallback_margin=args.sequential_fallback_margin,
         )
 
     modes = [args.mode] if args.mode != "compare" else ["baseline", "domino"]

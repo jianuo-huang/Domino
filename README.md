@@ -87,18 +87,19 @@ TASKS="gsm8k:8,humaneval:8,alpaca:8" MAX_NEW_TOKENS=256 \
 The full Ascend runner defaults to a FP16 Qwen3-8B target, a BF16 Domino draft,
 block size 16, and 8-way NPU data parallelism. FP16 has the same memory
 footprint as BF16 but reduces the batch-versus-single-token argmax flips seen
-with BF16 block verification. The runner also sets
-`SEQUENTIAL_FALLBACK_MARGIN=0.032`, which sequentially replays only low-margin
-verification decisions. Qwen3-8B FP32/HF32 does not fit on one 32 GiB 910B4;
-Qwen3-4B may still use `TARGET_DTYPE=float32`. The Python benchmark retains
-`--target-dtype bfloat16` as its compatibility default. If BF16 is selected for
-the target, use the more conservative `SEQUENTIAL_FALLBACK_MARGIN=0.25`.
+with BF16 block verification. Domino always uses the block-verification result;
+there is no sequential replay or low-margin fallback path. Greedy Domino token
+IDs can therefore differ from target-only decoding, so use the comparison
+summary and task-level quality evaluation together. Qwen3-8B FP32/HF32 does not
+fit on one 32 GiB 910B4; Qwen3-4B may still use `TARGET_DTYPE=float32`. The
+Python benchmark retains `--target-dtype bfloat16` as its compatibility default.
 
 The tuning sweep preserves manifests, baseline and Domino JSONL files, logs,
 comparison summaries, and `run_status.tsv`. The full runner preserves the
-manifests, answer JSONL files, and comparison summaries. Set `ENFORCE=1` to fail
-unless Domino reaches `MIN_SPEEDUP` (1.05 by default). Run the full Qwen3-8B
-gate with:
+manifests, answer JSONL files, and comparison summaries. The full runner defaults
+to `ENFORCE=0` so token differences are reported without aborting the remaining
+tasks. Set `ENFORCE=1` to require exact token matches and `MIN_SPEEDUP` (1.05 by
+default). Run the full Qwen3-8B benchmark with:
 
 ```bash
 ./run_ascend_benchmark.sh

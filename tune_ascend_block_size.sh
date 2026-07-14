@@ -20,9 +20,6 @@ Configuration is supplied through environment variables:
   TARGET_MODEL      Target model (default: Qwen/Qwen3-4B)
   TARGET_REVISION   Pinned target revision
   TARGET_DTYPE      Target weight dtype (default: float16)
-  SEQUENTIAL_FALLBACK_MARGIN
-                    Greedy low-margin sequential fallback threshold (default:
-                    -1, disabled for the FP16 target; use 0.25 with BF16)
   DRAFT_MODEL       Domino draft model (default: Huang2020/Qwen3-4B-Domino-b16)
   DRAFT_REVISION    Pinned draft revision
   MIN_SPEEDUP       Speedup reported as the target gate (default: 1.05)
@@ -54,7 +51,6 @@ PYTHON="${PYTHON:-python}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3-4B}"
 TARGET_REVISION="${TARGET_REVISION:-1cfa9a7208912126459214e8b04321603b3df60c}"
 TARGET_DTYPE="${TARGET_DTYPE:-float16}"
-SEQUENTIAL_FALLBACK_MARGIN="${SEQUENTIAL_FALLBACK_MARGIN:--1}"
 DRAFT_MODEL="${DRAFT_MODEL:-Huang2020/Qwen3-4B-Domino-b16}"
 DRAFT_REVISION="${DRAFT_REVISION:-12f52f165aea6e57e56373b2cb0d7f93bf41d4c1}"
 TASKS="${TASKS:-alpaca:4}"
@@ -118,7 +114,6 @@ printf 'dataset\tblock_size\tstatus\tanswer_file\tsummary_file\n' > "${STATUS_FI
 
 echo "Target: ${TARGET_MODEL}@${TARGET_REVISION}"
 echo "Target dtype: ${TARGET_DTYPE}"
-echo "Sequential fallback margin: ${SEQUENTIAL_FALLBACK_MARGIN}"
 echo "Draft: ${DRAFT_MODEL}@${DRAFT_REVISION}"
 echo "Tasks: ${TASKS}; block sizes: ${BLOCK_SIZES}"
 echo "Outputs: ${OUT_DIR}"
@@ -175,7 +170,6 @@ for task in "${TASK_ARRAY[@]}"; do
       --target-dtype "${TARGET_DTYPE}" \
       --draft-name-or-path "${DRAFT_MODEL}" --draft-revision "${DRAFT_REVISION}" \
       --block-size "${block_size}" --use-bias \
-      --sequential-fallback-margin "${SEQUENTIAL_FALLBACK_MARGIN}" \
       --max-new-tokens "${MAX_NEW_TOKENS}" \
       --warmup-samples "${WARMUP_SAMPLES}" --repetitions "${REPETITIONS}" \
       --answer-file "${DOMINO}" 2>&1 | tee "${DOMINO_LOG}"; then
