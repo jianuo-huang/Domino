@@ -284,7 +284,7 @@ def test_fp32_target_with_bf16_draft_casts_boundaries():
     assert target.lm_head.weight.dtype == torch.float32
 
 
-def test_benchmark_import_and_help_do_not_import_triton():
+def test_portable_benchmark_import_and_help_do_not_import_triton():
     child_code = f"""
 import builtins
 import importlib
@@ -300,17 +300,17 @@ def guarded_import(name, *args, **kwargs):
     return real_import(name, *args, **kwargs)
 
 builtins.__import__ = guarded_import
-benchmark = importlib.import_module('benchmark')
+benchmark = importlib.import_module('benchmark_portable')
 assert benchmark.TARGET_DTYPES['bfloat16'] == __import__('torch').bfloat16
 assert benchmark.TARGET_DTYPES['float32'] == __import__('torch').float32
 choice = benchmark._new_choice(0, 'domino', 16)
 assert 'sequential_fallbacks' not in choice
 assert 'sequential_catchup_mismatches' not in choice
 assert 'kernel.domino' not in sys.modules
-sys.modules.pop('benchmark', None)
-sys.argv = ['benchmark.py', '--help']
+sys.modules.pop('benchmark_portable', None)
+sys.argv = ['benchmark_portable.py', '--help']
 try:
-    runpy.run_path({str(CODE_DIR / 'benchmark.py')!r}, run_name='__main__')
+    runpy.run_path({str(CODE_DIR / 'benchmark_portable.py')!r}, run_name='__main__')
 except SystemExit as exc:
     if exc.code != 0:
         raise
@@ -337,11 +337,11 @@ assert 'kernel.domino' not in sys.modules
     assert "float32" in completed.stdout
 
 
-def test_benchmark_rejects_removed_sequential_fallback_option():
+def test_portable_benchmark_rejects_removed_sequential_fallback_option():
     completed = subprocess.run(
         [
             sys.executable,
-            str(CODE_DIR / "benchmark.py"),
+            str(CODE_DIR / "benchmark_portable.py"),
             "--sequential-fallback-margin",
             "-1",
         ],

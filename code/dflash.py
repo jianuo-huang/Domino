@@ -8,6 +8,16 @@ from torch.nn import functional as F
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
+# Keep the model-specific import used by the upstream CUDA workflow whenever
+# available.  Newer Transformers moved this base class to modeling_layers;
+# the final nn.Module fallback is only for inference-only older releases.
+try:
+    from transformers.models.qwen3.modeling_qwen3 import GradientCheckpointingLayer
+except ImportError:
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except ImportError:
+        GradientCheckpointingLayer = nn.Module
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
@@ -43,6 +53,12 @@ def device_time(device: torch.device | str | int | None = None) -> float:
 
     synchronize(device)
     return time.perf_counter()
+
+
+def cuda_time(device: torch.device | str | int | None = None) -> float:
+    """Backward-compatible name for the original CUDA timing helper."""
+
+    return device_time(device)
 
 
 def manual_gru(
@@ -216,6 +232,7 @@ def target_greedy_generate(
         total_wall_time=total_end - total_start,
         peak_memory_mb=max_memory_allocated_mb(device),
         acceptance_lengths=[],
+        steady_state_time_per_output_token=time_per_output_token,
     )
 
 
@@ -323,7 +340,7 @@ class Qwen3DFlashAttention(nn.Module):
         return attn_output, attn_weights
 
 
-class Qwen3DFlashDecoderLayer(nn.Module):
+class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -453,6 +470,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        # Keep draft inputs in the checkpoint dtype.  This is required for
+        # CANN's BF16 kernels and is harmless for the original CUDA workflow,
+        # whose target and draft checkpoints use the same dtype in practice.
         draft_dtype = self.fc.weight.dtype
         hidden_states = noise_embedding.to(dtype=draft_dtype)
         target_hidden = target_hidden.to(dtype=draft_dtype)
@@ -483,6 +503,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         graph_runner=None,
         use_bias: bool = True,
         return_dict: bool = False,
+        track_peak_memory: bool = False,
     ) -> torch.Tensor | SimpleNamespace:
         """Generate with Domino speculative decoding.
 
@@ -502,7 +523,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )
 
         input_ids = input_ids.to(self.device)
-        reset_peak_memory_stats(self.device)
+        if track_peak_memory:
+            reset_peak_memory_stats(self.device)
         total_start = device_time(self.device)
         block_size = int(block_size or self.block_size)
         mask_token_id = self.mask_token_id
@@ -552,13 +574,23 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         time_to_first_token = device_time(self.device) - prefill_start
 
         decode_start = device_time(self.device)
+        legacy_decode_start = decode_start
         start = num_input_tokens
         acceptance_lengths: list[int] = []
         draft_prefill = True
         draft_setup_time = 0.0
         prefix_len = int(self.pure_draft_prefix_len)
 
-        while start + 1 < max_length:
+        # The CUDA path intentionally keeps the upstream loop boundary.  Its
+        # final verification block may overrun ``max_length`` into the
+        # preallocated scratch area and is trimmed below, which is part of the
+        # original CUDA decoding/timing contract.  On NPU, running that final
+        # partial block triggers unsupported/out-of-range cache positions, so
+        # the portable path stops before ``start == max_length - 1`` and
+        # shortens the verification input below.
+        is_cuda = self.device.type == "cuda"
+        loop_limit = max_length if is_cuda else max_length - 1
+        while start < loop_limit:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             k_draft = block_size if shift_label else block_size - 1
             verify_ids = torch.full(
@@ -601,9 +633,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_values_draft.crop(start)
 
                 lm_head_dtype = target.lm_head.weight.dtype
-                base_logits = target.lm_head(
-                    parallel_hiddens.to(dtype=lm_head_dtype)
-                )
+                parallel_hiddens = parallel_hiddens.to(dtype=lm_head_dtype)
+                base_logits = target.lm_head(parallel_hiddens)
                 if prefix_len > 0:
                     prefix_token_ids = sample(base_logits[:, :prefix_len], temperature)
                     verify_ids[:, 1 : 1 + prefix_len] = prefix_token_ids
@@ -649,12 +680,21 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
                 if draft_prefill:
                     draft_prefill = False
-                    draft_setup_time = device_time(self.device) - draft_setup_start
+                    draft_setup_end = device_time(self.device)
+                    draft_setup_time = draft_setup_end - draft_setup_start
+                    # Reuse the same synchronized timestamp so the CUDA
+                    # timing path does not add an extra synchronization that
+                    # the upstream implementation never performed.
+                    legacy_decode_start = draft_setup_end
 
             # Each verified input can produce one new output token.  Do not run
             # target positions whose predictions would be discarded by the
             # max-new-tokens budget, especially in the final partial block.
-            verify_length = min(k_draft + 1, max_length - start - 1)
+            verify_length = (
+                k_draft + 1
+                if is_cuda
+                else min(k_draft + 1, max_length - start - 1)
+            )
             round_verify_ids = verify_ids[:, :verify_length]
             round_position_ids = verify_position_ids[:, :verify_length]
             output = target(
@@ -689,10 +729,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
             if stop_token_ids is not None:
                 stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
-                stop_check_end = min(start + 1, max_length)
-                if torch.isin(
-                    output_ids[:, num_input_tokens:stop_check_end], stop_tensor
-                ).any():
+                if not is_cuda:
+                    # Include the correction token produced at ``start`` so
+                    # the NPU path can stop without entering another partial
+                    # verification round.
+                    stop_check_end = min(start + 1, max_length)
+                    should_stop = torch.isin(
+                        output_ids[:, num_input_tokens:stop_check_end], stop_tensor
+                    ).any()
+                else:
+                    # Keep the original CUDA boundary: ``start`` is the
+                    # correction position and is checked by the final trim
+                    # below, not by this in-loop early-exit check.
+                    should_stop = torch.isin(
+                        output_ids[:, num_input_tokens:start], stop_tensor
+                    ).any()
+                if should_stop:
                     break
 
         output_ids = output_ids[:, :max_length]
@@ -707,17 +759,23 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     :, : num_input_tokens + stop_token_indices[0].item() + 1
                 ]
 
-        total_end = device_time(self.device)
         if not return_dict:
             return output_ids
 
+        total_end = device_time(self.device)
         num_output_tokens = output_ids.shape[1] - num_input_tokens
         total_decode_time = total_end - decode_start
+        legacy_decode_time = total_end - legacy_decode_start
         steady_state_decode_time = max(total_decode_time - draft_setup_time, 0.0)
         steady_state_tokens = max(num_output_tokens - 1, 0)
-        time_per_output_token = (
+        steady_state_time_per_output_token = (
             steady_state_decode_time / steady_state_tokens
             if steady_state_tokens > 0
+            else 0.0
+        )
+        time_per_output_token = (
+            legacy_decode_time / num_output_tokens
+            if num_output_tokens > 0
             else 0.0
         )
         return SimpleNamespace(
@@ -730,7 +788,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             decode_time=total_decode_time,
             steady_state_decode_time=steady_state_decode_time,
             time_per_output_token=time_per_output_token,
+            steady_state_time_per_output_token=steady_state_time_per_output_token,
             total_wall_time=total_end - total_start,
-            peak_memory_mb=max_memory_allocated_mb(self.device),
+            peak_memory_mb=(
+                max_memory_allocated_mb(self.device) if track_peak_memory else 0.0
+            ),
             acceptance_lengths=acceptance_lengths,
         )

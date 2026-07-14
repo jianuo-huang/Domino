@@ -23,10 +23,10 @@ __all__ = [
 def init(backend: Optional[str] = None) -> None:
     """Initialize a launcher's process group on CUDA, NPU, or CPU.
 
-    ``backend`` accepts accelerator names (``auto``, ``cuda``, ``npu``,
-    ``cpu``) as well as native distributed names (``nccl``, ``hccl``,
-    ``gloo``).  Existing no-argument CUDA callers remain compatible through
-    auto-detection.
+    A no-argument call preserves the upstream CUDA contract and initializes
+    NCCL.  Portable entry points pass an accelerator name (``cuda``, ``npu``,
+    or ``cpu``) or a native backend (``nccl``, ``hccl``, or ``gloo``)
+    explicitly.
     """
 
     if "RANK" not in os.environ:
@@ -38,10 +38,8 @@ def init(backend: Optional[str] = None) -> None:
     if dist.is_initialized():
         return
 
-    selected_backend = distributed_backend(backend)
-    if selected_backend == "nccl":
-        set_device(local_rank(), backend="cuda")
-    elif selected_backend == "hccl":
+    selected_backend = "nccl" if backend is None else distributed_backend(backend)
+    if selected_backend == "hccl":
         set_device(local_rank(), backend="npu")
 
     dist.init_process_group(
@@ -53,7 +51,7 @@ def init(backend: Optional[str] = None) -> None:
     # Connect while every rank is still together instead of at the final
     # result-merge barrier, where variable-length generations can leave fast
     # and slow ranks more than HCCL's connection timeout apart.
-    if size() > 1:
+    if selected_backend == "hccl" and size() > 1:
         dist.barrier()
 
 

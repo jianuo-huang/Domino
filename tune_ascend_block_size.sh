@@ -49,10 +49,14 @@ source "${SCRIPT_DIR}/activate_ascend.sh"
 
 PYTHON="${PYTHON:-python}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3-4B}"
-TARGET_REVISION="${TARGET_REVISION:-1cfa9a7208912126459214e8b04321603b3df60c}"
+if [[ ! -v TARGET_REVISION ]]; then
+  TARGET_REVISION="1cfa9a7208912126459214e8b04321603b3df60c"
+fi
 TARGET_DTYPE="${TARGET_DTYPE:-float16}"
 DRAFT_MODEL="${DRAFT_MODEL:-Huang2020/Qwen3-4B-Domino-b16}"
-DRAFT_REVISION="${DRAFT_REVISION:-12f52f165aea6e57e56373b2cb0d7f93bf41d4c1}"
+if [[ ! -v DRAFT_REVISION ]]; then
+  DRAFT_REVISION="12f52f165aea6e57e56373b2cb0d7f93bf41d4c1"
+fi
 TASKS="${TASKS:-alpaca:4}"
 BLOCK_SIZES="${BLOCK_SIZES:-4,8,12,16}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
@@ -63,6 +67,15 @@ MASTER_PORT="${MASTER_PORT:-29661}"
 MIN_SPEEDUP="${MIN_SPEEDUP:-1.05}"
 ENFORCE="${ENFORCE:-0}"
 OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/outputs/ascend_tuning_$(date +%Y%m%d_%H%M%S)}"
+
+TARGET_REVISION_ARGS=()
+if [[ -n "${TARGET_REVISION}" ]]; then
+  TARGET_REVISION_ARGS=(--model-revision "${TARGET_REVISION}")
+fi
+DRAFT_REVISION_ARGS=()
+if [[ -n "${DRAFT_REVISION}" ]]; then
+  DRAFT_REVISION_ARGS=(--draft-revision "${DRAFT_REVISION}")
+fi
 
 if [[ "${ENFORCE}" != "0" && "${ENFORCE}" != "1" ]]; then
   echo "ENFORCE must be 0 or 1, got: ${ENFORCE}" >&2
@@ -127,7 +140,7 @@ for task in "${TASK_ARRAY[@]}"; do
   BASELINE="${OUT_DIR}/${SAFE_DATASET}_baseline.jsonl"
   BASELINE_LOG="${OUT_DIR}/${SAFE_DATASET}_baseline.log"
 
-  "${PYTHON}" "${SCRIPT_DIR}/code/benchmark.py" \
+  "${PYTHON}" "${SCRIPT_DIR}/code/benchmark_portable.py" \
     --dataset "${DATASET}" --max-samples "${MAX_SAMPLES}" \
     --dump-benchmark-manifest "${MANIFEST}" --dump-only
 
@@ -137,10 +150,10 @@ for task in "${TASK_ARRAY[@]}"; do
   fi
   if ! "${PYTHON}" -m torch.distributed.run \
     --nproc_per_node="${NUM_NPUS}" --master_port="${PORT_CURSOR}" \
-    "${SCRIPT_DIR}/code/benchmark.py" \
+    "${SCRIPT_DIR}/code/benchmark_portable.py" \
     --mode baseline --device-backend npu --attn-implementation sdpa \
     --benchmark-manifest "${MANIFEST}" \
-    --model-name-or-path "${TARGET_MODEL}" --model-revision "${TARGET_REVISION}" \
+    --model-name-or-path "${TARGET_MODEL}" "${TARGET_REVISION_ARGS[@]}" \
     --target-dtype "${TARGET_DTYPE}" \
     --max-new-tokens "${MAX_NEW_TOKENS}" \
     --warmup-samples "${WARMUP_SAMPLES}" --repetitions "${REPETITIONS}" \
@@ -163,12 +176,12 @@ for task in "${TASK_ARRAY[@]}"; do
     fi
     if ! "${PYTHON}" -m torch.distributed.run \
       --nproc_per_node="${NUM_NPUS}" --master_port="${PORT_CURSOR}" \
-      "${SCRIPT_DIR}/code/benchmark.py" \
+      "${SCRIPT_DIR}/code/benchmark_portable.py" \
       --mode domino --device-backend npu --attn-implementation sdpa \
       --benchmark-manifest "${MANIFEST}" \
-      --model-name-or-path "${TARGET_MODEL}" --model-revision "${TARGET_REVISION}" \
+      --model-name-or-path "${TARGET_MODEL}" "${TARGET_REVISION_ARGS[@]}" \
       --target-dtype "${TARGET_DTYPE}" \
-      --draft-name-or-path "${DRAFT_MODEL}" --draft-revision "${DRAFT_REVISION}" \
+      --draft-name-or-path "${DRAFT_MODEL}" "${DRAFT_REVISION_ARGS[@]}" \
       --block-size "${block_size}" --use-bias \
       --max-new-tokens "${MAX_NEW_TOKENS}" \
       --warmup-samples "${WARMUP_SAMPLES}" --repetitions "${REPETITIONS}" \

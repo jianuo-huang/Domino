@@ -43,10 +43,23 @@ source ./activate_ascend.sh
 ```
 
 `activate_ascend.sh` activates the `domino-ascend` environment, prevents user
-site packages and an inherited `PYTHONPATH` from contaminating it, sets
-`HF_HOME=/mnt/nvme0/zhujiayi/.cache/huggingface`, and sources the versioned CANN
-8.0.1 setup script. Set `DOMINO_CONDA_ENV`, `DOMINO_HF_HOME`, or `CANN_ROOT`
-before sourcing it only when the local installation uses different paths.
+site packages and an inherited `PYTHONPATH` from contaminating it, preserves
+the standard Hugging Face cache selection, and discovers a configured CANN
+installation. Set `DOMINO_CONDA_ENV`, `DOMINO_HF_HOME`, `CANN_ENV_SCRIPT`, or
+`CANN_ROOT` before sourcing it when the local installation uses different
+paths. The Conda files install Python packages only; CANN and the NPU driver
+must be installed by the host administrator.
+
+The Ascend runner defaults to the public `Qwen/Qwen3-8B` and
+`Huang2020/Qwen3-8B-Domino-b16` model IDs. Set `TARGET_MODEL` or `DRAFT_MODEL`
+to use a local directory. Set the corresponding revision variable to an empty
+string when a local directory should not receive a pinned Hub revision:
+
+```bash
+TARGET_MODEL=/models/Qwen3-8B TARGET_REVISION= \
+DRAFT_MODEL=/models/Qwen3-8B-Domino-b16 DRAFT_REVISION= \
+./run_ascend_benchmark.sh
+```
 
 Verify the environment before running a model:
 

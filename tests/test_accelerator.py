@@ -41,14 +41,17 @@ class FakeNPU:
         return 8
 
 
-def test_auto_prefers_npu_then_cuda(monkeypatch):
+def test_auto_prefers_cuda_then_npu(monkeypatch):
     fake_npu = FakeNPU(available=True)
     monkeypatch.setattr(accelerator, "_npu_api", lambda required=True: fake_npu)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    assert accelerator.resolve_backend(requested="auto") == "npu"
+    assert accelerator.resolve_backend(requested="auto") == "cuda"
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert accelerator.resolve_backend("auto") == "npu"
 
     fake_npu.available = False
-    assert accelerator.resolve_backend("auto") == "cuda"
+    assert accelerator.resolve_backend("auto") == "cpu"
 
 
 def test_auto_falls_back_to_cpu_and_explicit_unavailable_raises(monkeypatch):
@@ -98,7 +101,7 @@ def test_distributed_backend_mapping(monkeypatch, accelerator_name, expected):
     assert accelerator.distributed_backend(expected) == expected
 
 
-def test_distributed_init_binds_npu_before_hccl(monkeypatch):
+def test_distributed_init_binds_npu_before_hccl_when_explicit(monkeypatch):
     events = []
     monkeypatch.setenv("RANK", "0")
     monkeypatch.setenv("LOCAL_RANK", "5")
@@ -121,13 +124,44 @@ def test_distributed_init_binds_npu_before_hccl(monkeypatch):
         lambda: events.append(("barrier",)),
     )
 
-    domino_dist.init()
+    domino_dist.init("npu")
 
     assert events[0] == ("set_device", 5, "npu")
     assert events[1][0] == "init_process_group"
     assert events[1][1]["backend"] == "hccl"
     assert events[1][1]["init_method"] == "env://"
     assert events[2] == ("barrier",)
+
+
+def test_distributed_init_defaults_to_nccl_without_npu_binding(monkeypatch):
+    events = []
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "5")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(domino_dist.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        domino_dist,
+        "set_device",
+        lambda device, backend: events.append(("set_device", device, backend)),
+    )
+    monkeypatch.setattr(
+        domino_dist.dist,
+        "init_process_group",
+        lambda **kwargs: events.append(("init_process_group", kwargs)),
+    )
+    monkeypatch.setattr(
+        domino_dist.dist,
+        "barrier",
+        lambda: events.append(("barrier",)),
+    )
+
+    domino_dist.init()
+
+    assert events[0][0] == "init_process_group"
+    assert events[0][1]["backend"] == "nccl"
+    assert events[0][1]["init_method"] == "env://"
+    assert all(event[0] != "set_device" for event in events)
+    assert all(event[0] != "barrier" for event in events)
 
 
 def test_distributed_init_is_noop_when_already_initialized(monkeypatch):

@@ -93,14 +93,15 @@ def is_backend_available(backend: str) -> bool:
 def resolve_backend(requested: Optional[str] = "auto") -> str:
     """Resolve ``auto`` and validate an explicitly requested backend.
 
-    NPU is checked before CUDA so an Ascend host with compatibility CUDA
-    packages installed still selects its native device.  CPU is a deliberate
-    final fallback for unit tests and diagnostic commands.
+    CUDA is checked before NPU to preserve the original CUDA default on hosts
+    where both extensions are installed.  Ascend entry points request the NPU
+    backend explicitly.  CPU is a deliberate final fallback for tests and
+    diagnostic commands.
     """
 
     backend = _normalize_backend(requested)
     if backend == "auto":
-        for candidate in ("npu", "cuda"):
+        for candidate in ("cuda", "npu"):
             if is_backend_available(candidate):
                 return candidate
         return "cpu"
