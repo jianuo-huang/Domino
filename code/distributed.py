@@ -3,6 +3,9 @@ import warnings
 from typing import Any, List, Optional
 from torch import distributed as dist
 import datetime
+
+from accelerator import distributed_backend, set_device
+
 __all__ = [
     "init",
     "is_initialized",
@@ -15,11 +18,41 @@ __all__ = [
     "gather",
     "all_gather",
 ]
-def init() -> None:
+
+
+def init(backend: Optional[str] = None) -> None:
+    """Initialize a launcher's process group on CUDA, NPU, or CPU.
+
+    A no-argument call preserves the upstream CUDA contract and initializes
+    NCCL.  Portable entry points pass an accelerator name (``cuda``, ``npu``,
+    or ``cpu``) or a native backend (``nccl``, ``hccl``, or ``gloo``)
+    explicitly.
+    """
+
     if "RANK" not in os.environ:
-        warnings.warn("Environment variable `RANK` is not set. Skipping distributed initialization.")
+        warnings.warn(
+            "Environment variable `RANK` is not set. Skipping distributed initialization.",
+            stacklevel=2,
+        )
         return
-    dist.init_process_group(backend="nccl", init_method="env://", timeout=datetime.timedelta(hours=2))
+    if dist.is_initialized():
+        return
+
+    selected_backend = "nccl" if backend is None else distributed_backend(backend)
+    if selected_backend == "hccl":
+        set_device(local_rank(), backend="npu")
+
+    dist.init_process_group(
+        backend=selected_backend,
+        init_method="env://",
+        timeout=datetime.timedelta(hours=2),
+    )
+    # HCCL establishes device communication lazily on the first collective.
+    # Connect while every rank is still together instead of at the final
+    # result-merge barrier, where variable-length generations can leave fast
+    # and slow ranks more than HCCL's connection timeout apart.
+    if selected_backend == "hccl" and size() > 1:
+        dist.barrier()
 
 
 def is_initialized() -> bool:

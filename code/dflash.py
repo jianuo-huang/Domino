@@ -4,13 +4,23 @@ from typing import Callable, Optional
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
+# Keep the model-specific import used by the upstream CUDA workflow whenever
+# available.  Newer Transformers moved this base class to modeling_layers;
+# the final nn.Module fallback is only for inference-only older releases.
+try:
+    from transformers.models.qwen3.modeling_qwen3 import GradientCheckpointingLayer
+except ImportError:
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except ImportError:
+        GradientCheckpointingLayer = nn.Module
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
-    GradientCheckpointingLayer,
     Qwen3Config,
     Qwen3MLP,
     Qwen3PreTrainedModel,
@@ -20,6 +30,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 from typing_extensions import Tuple, Unpack
+
+from accelerator import max_memory_allocated_mb, reset_peak_memory_stats, synchronize
 
 
 def is_domino_projector(projector_type):
@@ -36,19 +48,192 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
-def cuda_time(device: torch.device | str | int | None = None) -> float:
-    if torch.cuda.is_available():
-        if device is None:
-            torch.cuda.synchronize()
-        else:
-            cuda_device = (
-                torch.device(f"cuda:{device}")
-                if isinstance(device, int)
-                else torch.device(device)
-            )
-            if cuda_device.type == "cuda":
-                torch.cuda.synchronize(cuda_device)
+def device_time(device: torch.device | str | int | None = None) -> float:
+    """Return a synchronized wall-clock timestamp for accelerator timing."""
+
+    synchronize(device)
     return time.perf_counter()
+
+
+def cuda_time(device: torch.device | str | int | None = None) -> float:
+    """Backward-compatible name for the original CUDA timing helper."""
+
+    return device_time(device)
+
+
+def manual_gru(
+    gru: nn.GRU,
+    inputs: torch.Tensor,
+    hidden: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a one-layer, unidirectional GRU with basic PyTorch operators.
+
+    CANN 8.0 does not provide a BF16 DynamicGRU kernel.  Expanding the cell
+    keeps checkpoint weights and PyTorch's r/z/n gate semantics unchanged while
+    allowing torch_npu to dispatch Linear, sigmoid, and tanh independently.
+    """
+
+    if gru.num_layers != 1 or gru.bidirectional:
+        raise ValueError("manual_gru supports one unidirectional GRU layer only.")
+    if not gru.batch_first:
+        inputs = inputs.transpose(0, 1)
+    batch_size = inputs.shape[0]
+    if hidden is None:
+        h_state = torch.zeros(
+            batch_size,
+            gru.hidden_size,
+            dtype=inputs.dtype,
+            device=inputs.device,
+        )
+    else:
+        if hidden.shape != (1, batch_size, gru.hidden_size):
+            raise ValueError(
+                "hidden must have shape "
+                f"(1, {batch_size}, {gru.hidden_size}), got {tuple(hidden.shape)}."
+            )
+        h_state = hidden[0]
+
+    outputs = []
+    bias_ih = gru.bias_ih_l0 if gru.bias else None
+    bias_hh = gru.bias_hh_l0 if gru.bias else None
+    for step in range(inputs.shape[1]):
+        gi = F.linear(inputs[:, step, :], gru.weight_ih_l0, bias_ih)
+        gh = F.linear(h_state, gru.weight_hh_l0, bias_hh)
+        i_r, i_z, i_n = gi.chunk(3, dim=-1)
+        h_r, h_z, h_n = gh.chunk(3, dim=-1)
+        reset = torch.sigmoid(i_r + h_r)
+        update = torch.sigmoid(i_z + h_z)
+        candidate = torch.tanh(i_n + reset * h_n)
+        h_state = (1.0 - update) * candidate + update * h_state
+        outputs.append(h_state)
+
+    output = torch.stack(outputs, dim=1)
+    if not gru.batch_first:
+        output = output.transpose(0, 1)
+    return output, h_state.unsqueeze(0)
+
+
+def run_gru(
+    gru: nn.GRU,
+    inputs: torch.Tensor,
+    hidden: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the portable GRU expansion on NPU and native GRU elsewhere."""
+
+    if inputs.device.type == "npu":
+        return manual_gru(gru, inputs, hidden)
+    if hidden is None:
+        return gru(inputs)
+    return gru(inputs, hidden)
+
+
+@torch.inference_mode()
+def target_greedy_generate(
+    input_ids: torch.Tensor,
+    target: nn.Module,
+    max_new_tokens: int = 2048,
+    temperature: float = 0.0,
+    stop_token_ids: Optional[list[int] | int] = None,
+    return_dict: bool = False,
+) -> torch.Tensor | SimpleNamespace:
+    """Generate directly with the target model using the same cache loop.
+
+    Keeping this baseline independent from the draft model makes memory and
+    latency comparisons fair: the baseline process never loads Domino weights.
+    """
+
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError(
+            "target_greedy_generate supports input_ids with shape [1, seq_len]."
+        )
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be at least 1.")
+
+    device = next(target.parameters()).device
+    input_ids = input_ids.to(device)
+    if isinstance(stop_token_ids, int):
+        stop_token_ids = [stop_token_ids]
+    elif stop_token_ids is not None:
+        stop_token_ids = list(stop_token_ids)
+
+    reset_peak_memory_stats(device)
+    total_start = device_time(device)
+    num_input_tokens = input_ids.shape[1]
+    max_length = num_input_tokens + int(max_new_tokens)
+    output_ids = torch.empty(
+        (1, max_length), dtype=torch.long, device=device
+    )
+    output_ids[:, :num_input_tokens] = input_ids
+    position_ids = torch.arange(max_length, device=device).unsqueeze(0)
+    past_key_values = DynamicCache()
+
+    prefill_start = device_time(device)
+    output = target(
+        input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values,
+        use_cache=True,
+        logits_to_keep=1,
+        output_hidden_states=False,
+    )
+    output_ids[:, num_input_tokens] = sample(output.logits, temperature)[:, -1]
+    time_to_first_token = device_time(device) - prefill_start
+
+    decode_start = device_time(device)
+    current = num_input_tokens
+    stop_tensor = (
+        torch.tensor(stop_token_ids, device=device)
+        if stop_token_ids is not None
+        else None
+    )
+    stopped = bool(
+        stop_tensor is not None
+        and torch.isin(output_ids[:, current], stop_tensor).any().item()
+    )
+    while current + 1 < max_length and not stopped:
+        output = target(
+            output_ids[:, current : current + 1],
+            position_ids=position_ids[:, current : current + 1],
+            past_key_values=past_key_values,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=False,
+        )
+        current += 1
+        output_ids[:, current] = sample(output.logits, temperature)[:, -1]
+        if stop_tensor is not None:
+            stopped = bool(
+                torch.isin(output_ids[:, current], stop_tensor).any().item()
+            )
+
+    output_ids = output_ids[:, : current + 1]
+    total_end = device_time(device)
+    if not return_dict:
+        return output_ids
+
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    total_decode_time = total_end - decode_start
+    steady_state_tokens = max(num_output_tokens - 1, 0)
+    time_per_output_token = (
+        total_decode_time / steady_state_tokens
+        if steady_state_tokens > 0
+        else 0.0
+    )
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        time_to_first_token=time_to_first_token,
+        target_prefill_time=time_to_first_token,
+        draft_setup_time=0.0,
+        decode_time=total_decode_time,
+        steady_state_decode_time=total_decode_time,
+        time_per_output_token=time_per_output_token,
+        total_wall_time=total_end - total_start,
+        peak_memory_mb=max_memory_allocated_mb(device),
+        acceptance_lengths=[],
+        steady_state_time_per_output_token=time_per_output_token,
+    )
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -285,7 +470,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden_states = noise_embedding
+        # Keep draft inputs in the checkpoint dtype.  This is required for
+        # CANN's BF16 kernels and is harmless for the original CUDA workflow,
+        # whose target and draft checkpoints use the same dtype in practice.
+        draft_dtype = self.fc.weight.dtype
+        hidden_states = noise_embedding.to(dtype=draft_dtype)
+        target_hidden = target_hidden.to(dtype=draft_dtype)
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
@@ -313,10 +503,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         graph_runner=None,
         use_bias: bool = True,
         return_dict: bool = False,
+        track_peak_memory: bool = False,
     ) -> torch.Tensor | SimpleNamespace:
         """Generate with Domino speculative decoding.
 
-        This method currently supports a single sequence on one GPU, matching the
+        This method currently supports a single sequence on one accelerator, matching the
         draft checkpoints released with this repository.
         """
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -332,6 +523,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )
 
         input_ids = input_ids.to(self.device)
+        if track_peak_memory:
+            reset_peak_memory_stats(self.device)
+        total_start = device_time(self.device)
         block_size = int(block_size or self.block_size)
         mask_token_id = self.mask_token_id
         if mask_token_id is None:
@@ -359,7 +553,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
 
-        prefill_start = cuda_time(self.device)
+        prefill_start = device_time(self.device)
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -377,15 +571,26 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             target_hidden = extract_context_feature(
                 output.hidden_states, self.target_layer_ids
             )
-        time_to_first_token = cuda_time(self.device) - prefill_start
+        time_to_first_token = device_time(self.device) - prefill_start
 
-        decode_start = cuda_time(self.device)
+        decode_start = device_time(self.device)
+        legacy_decode_start = decode_start
         start = num_input_tokens
         acceptance_lengths: list[int] = []
         draft_prefill = True
+        draft_setup_time = 0.0
         prefix_len = int(self.pure_draft_prefix_len)
 
-        while start < max_length:
+        # The CUDA path intentionally keeps the upstream loop boundary.  Its
+        # final verification block may overrun ``max_length`` into the
+        # preallocated scratch area and is trimmed below, which is part of the
+        # original CUDA decoding/timing contract.  On NPU, running that final
+        # partial block triggers unsupported/out-of-range cache positions, so
+        # the portable path stops before ``start == max_length - 1`` and
+        # shortens the verification input below.
+        is_cuda = self.device.type == "cuda"
+        loop_limit = max_length if is_cuda else max_length - 1
+        while start < loop_limit:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             k_draft = block_size if shift_label else block_size - 1
             verify_ids = torch.full(
@@ -398,6 +603,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             verify_position_ids = position_ids[:, start : start + k_draft + 1]
 
             if block_size > 1:
+                draft_setup_start = (
+                    device_time(self.device) if draft_prefill else None
+                )
                 if not is_domino_projector(self.projector_type):
                     raise ValueError(
                         "This package only supports Domino checkpoints; "
@@ -406,9 +614,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 if not use_bias:
                     raise ValueError("Domino generation requires use_bias=True.")
 
-                noise_embedding = target.model.embed_tokens(block_output_ids)
+                draft_dtype = self.prefix_gru.weight_ih_l0.dtype
+                noise_embedding = target.model.embed_tokens(block_output_ids).to(
+                    dtype=draft_dtype
+                )
                 parallel_hiddens = self(
-                    target_hidden=target_hidden,
+                    target_hidden=target_hidden.to(dtype=draft_dtype),
                     noise_embedding=noise_embedding,
                     position_ids=position_ids[
                         :, past_key_values_draft.get_seq_length() : start + block_size
@@ -421,6 +632,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     parallel_hiddens = parallel_hiddens[:, -block_size + 1 :, :]
                 past_key_values_draft.crop(start)
 
+                lm_head_dtype = target.lm_head.weight.dtype
+                parallel_hiddens = parallel_hiddens.to(dtype=lm_head_dtype)
                 base_logits = target.lm_head(parallel_hiddens)
                 if prefix_len > 0:
                     prefix_token_ids = sample(base_logits[:, :prefix_len], temperature)
@@ -439,8 +652,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     )
                 else:
                     realized_prefix_ids = verify_ids[:, : 1 + prefix_len]
-                    realized_prefix_embeds = target.model.embed_tokens(realized_prefix_ids)
-                    _, gru_hidden = self.prefix_gru(realized_prefix_embeds)
+                    realized_prefix_embeds = target.model.embed_tokens(
+                        realized_prefix_ids
+                    ).to(dtype=self.prefix_gru.weight_ih_l0.dtype)
+                    _, gru_hidden = run_gru(self.prefix_gru, realized_prefix_embeds)
 
                     for i in range(prefix_len, k_draft):
                         z_i = parallel_hiddens[:, i : i + 1, :]
@@ -448,22 +663,43 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
                         bias = self.embed_proj(torch.cat([z_i, s_i], dim=-1))
                         current_token_id = sample(
-                            base_logits[:, i : i + 1, :] + bias,
+                            base_logits[:, i : i + 1, :]
+                            + bias.to(dtype=base_logits.dtype),
                             temperature,
                         )
                         verify_ids[:, i + 1 : i + 2] = current_token_id
 
                         if i + 1 < k_draft:
                             new_embed = target.model.embed_tokens(current_token_id)
-                            _, gru_hidden = self.prefix_gru(new_embed, gru_hidden)
+                            new_embed = new_embed.to(
+                                dtype=self.prefix_gru.weight_ih_l0.dtype
+                            )
+                            _, gru_hidden = run_gru(
+                                self.prefix_gru, new_embed, gru_hidden
+                            )
 
                 if draft_prefill:
                     draft_prefill = False
-                    decode_start = cuda_time(self.device)
+                    draft_setup_end = device_time(self.device)
+                    draft_setup_time = draft_setup_end - draft_setup_start
+                    # Reuse the same synchronized timestamp so the CUDA
+                    # timing path does not add an extra synchronization that
+                    # the upstream implementation never performed.
+                    legacy_decode_start = draft_setup_end
 
+            # Each verified input can produce one new output token.  Do not run
+            # target positions whose predictions would be discarded by the
+            # max-new-tokens budget, especially in the final partial block.
+            verify_length = (
+                k_draft + 1
+                if is_cuda
+                else min(k_draft + 1, max_length - start - 1)
+            )
+            round_verify_ids = verify_ids[:, :verify_length]
+            round_position_ids = verify_position_ids[:, :verify_length]
             output = target(
-                verify_ids,
-                position_ids=verify_position_ids,
+                round_verify_ids,
+                position_ids=round_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=block_size > 1,
@@ -471,17 +707,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
             posterior = sample(output.logits, temperature)
             acceptance_length = (
-                (verify_ids[:, 1:] == posterior[:, :-1])
+                (round_verify_ids[:, 1:] == posterior[:, :-1])
                 .cumprod(dim=1)
                 .sum(dim=1)[0]
                 .item()
             )
-            output_ids[:, start : start + acceptance_length + 1] = verify_ids[
+            correction = posterior[:, acceptance_length : acceptance_length + 1]
+
+            output_ids[:, start : start + acceptance_length + 1] = round_verify_ids[
                 :, : acceptance_length + 1
             ]
-            output_ids[:, start + acceptance_length + 1] = posterior[
-                :, acceptance_length
-            ]
+            output_ids[:, start + acceptance_length + 1] = correction[:, 0]
 
             acceptance_lengths.append(int(acceptance_length) + 1)
             start += int(acceptance_length) + 1
@@ -493,7 +729,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
             if stop_token_ids is not None:
                 stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
-                if torch.isin(output_ids[:, num_input_tokens:start], stop_tensor).any():
+                if not is_cuda:
+                    # Include the correction token produced at ``start`` so
+                    # the NPU path can stop without entering another partial
+                    # verification round.
+                    stop_check_end = min(start + 1, max_length)
+                    should_stop = torch.isin(
+                        output_ids[:, num_input_tokens:stop_check_end], stop_tensor
+                    ).any()
+                else:
+                    # Keep the original CUDA boundary: ``start`` is the
+                    # correction position and is checked by the final trim
+                    # below, not by this in-loop early-exit check.
+                    should_stop = torch.isin(
+                        output_ids[:, num_input_tokens:start], stop_tensor
+                    ).any()
+                if should_stop:
                     break
 
         output_ids = output_ids[:, :max_length]
@@ -511,16 +762,36 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if not return_dict:
             return output_ids
 
+        total_end = device_time(self.device)
         num_output_tokens = output_ids.shape[1] - num_input_tokens
-        total_decode_time = cuda_time(self.device) - decode_start
+        total_decode_time = total_end - decode_start
+        legacy_decode_time = total_end - legacy_decode_start
+        steady_state_decode_time = max(total_decode_time - draft_setup_time, 0.0)
+        steady_state_tokens = max(num_output_tokens - 1, 0)
+        steady_state_time_per_output_token = (
+            steady_state_decode_time / steady_state_tokens
+            if steady_state_tokens > 0
+            else 0.0
+        )
         time_per_output_token = (
-            total_decode_time / num_output_tokens if num_output_tokens > 0 else 0.0
+            legacy_decode_time / num_output_tokens
+            if num_output_tokens > 0
+            else 0.0
         )
         return SimpleNamespace(
             output_ids=output_ids,
             num_input_tokens=num_input_tokens,
             num_output_tokens=num_output_tokens,
             time_to_first_token=time_to_first_token,
+            target_prefill_time=time_to_first_token,
+            draft_setup_time=draft_setup_time,
+            decode_time=total_decode_time,
+            steady_state_decode_time=steady_state_decode_time,
             time_per_output_token=time_per_output_token,
+            steady_state_time_per_output_token=steady_state_time_per_output_token,
+            total_wall_time=total_end - total_start,
+            peak_memory_mb=(
+                max_memory_allocated_mb(self.device) if track_peak_memory else 0.0
+            ),
             acceptance_lengths=acceptance_lengths,
         )

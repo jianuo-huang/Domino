@@ -6,6 +6,9 @@ outputs/
 cache/
 .cache/
 demo/
+fusion_result.json
+ge_check_op.json
+kernel_meta/
 
 checkpoints/
 qwen4B-Domino/

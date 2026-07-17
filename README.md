@@ -27,6 +27,8 @@ Domino is a speculative decoding method that keeps draft generation block-parall
 
 ## Installation
 
+### CUDA
+
 Use Python 3.10 or newer on a CUDA GPU machine. Install a PyTorch build that matches your CUDA driver, then install the remaining Hugging Face benchmark dependencies:
 
 ```bash
@@ -85,6 +87,97 @@ cd -
 ```
 
 Set `SGLANG_KERNEL_CU12_WHEEL` to a CUDA-12-compatible `sglang-kernel` wheel before running the last command. Do not install the `cu130` wheel in a PyTorch 2.9/cu128 environment.
+
+### Initial Ascend Support
+
+The initial Ascend implementation targets an eight-card Ascend 910B4 server
+with CANN 8.0.1. It uses the eager PyTorch/SDPA path through `torch_npu`;
+Triton, CUDA Graph, NPUGraph, FlashAttention, SGLang, and custom AscendC kernels
+are not part of this first migration stage.
+
+Create a clean, standalone Conda environment before running or modifying the
+Ascend path:
+
+```bash
+conda env create -f environment-ascend.yml
+source ./activate_ascend.sh
+```
+
+`activate_ascend.sh` activates the `domino-ascend` environment, prevents user
+site packages and an inherited `PYTHONPATH` from contaminating it, preserves
+the standard Hugging Face cache selection, and discovers a configured CANN
+installation. Set `DOMINO_CONDA_ENV`, `DOMINO_HF_HOME`, `CANN_ENV_SCRIPT`, or
+`CANN_ROOT` before sourcing it when the local installation uses different
+paths. The Conda files install Python packages only; CANN and the NPU driver
+must be installed by the host administrator.
+
+The Ascend runner defaults to the public `Qwen/Qwen3-8B` and
+`Huang2020/Qwen3-8B-Domino-b16` model IDs. Set `TARGET_MODEL` or `DRAFT_MODEL`
+to use a local directory. Set the corresponding revision variable to an empty
+string when a local directory should not receive a pinned Hub revision:
+
+```bash
+TARGET_MODEL=/models/Qwen3-8B TARGET_REVISION= \
+DRAFT_MODEL=/models/Qwen3-8B-Domino-b16 DRAFT_REVISION= \
+./run_ascend_benchmark.sh
+```
+
+Verify the environment before running a model:
+
+```bash
+PYTHONPATH= python -m pip check
+python - <<'PY'
+import torch
+import torch_npu
+
+assert torch.npu.is_available()
+print("torch:", torch.__version__)
+print("torch_npu:", torch_npu.__version__)
+print("NPU count:", torch.npu.device_count())
+PY
+```
+
+For a manual installation instead of the Conda YAML, create Python 3.10 with
+pip 25.2, then install `requirements-ascend.txt`. Do not also install
+`requirements-hf.txt`, because that file includes the CUDA Triton dependency.
+
+Before the full benchmark, run the short Qwen3-4B block-size sweep:
+
+```bash
+./tune_ascend_block_size.sh
+```
+
+It tests block sizes `4,8,12,16`, runs one shared target-only baseline, rejects
+any candidate whose token IDs differ from the baseline, and writes the fastest
+legal choice to `selected_block_size.json`. The short defaults are Alpaca with
+4 samples, 128 generated tokens, one warmup, and two timed repetitions. Override
+them with environment variables when needed, for example:
+
+```bash
+TASKS="gsm8k:8,humaneval:8,alpaca:8" MAX_NEW_TOKENS=256 \
+  REPETITIONS=3 NUM_NPUS=1 ./tune_ascend_block_size.sh
+```
+
+The full Ascend runner defaults to a FP16 Qwen3-8B target, a BF16 Domino draft,
+block size 16, and 8-way NPU data parallelism. FP16 has the same memory
+footprint as BF16 but reduces the batch-versus-single-token argmax flips seen
+with BF16 block verification. Domino always uses the block-verification result;
+there is no sequential replay or low-margin fallback path. Greedy Domino token
+IDs can therefore differ from target-only decoding, so use the comparison
+summary and task-level quality evaluation together. Qwen3-8B FP32/HF32 does not
+fit on one 32 GiB 910B4; Qwen3-4B may still use `TARGET_DTYPE=float32`. The
+Python benchmark retains `--target-dtype bfloat16` as its compatibility default.
+
+The tuning sweep preserves manifests, baseline and Domino JSONL files, logs,
+comparison summaries, and `run_status.tsv`. The full runner preserves the
+manifests, answer JSONL files, and comparison summaries. The full runner defaults
+to `ENFORCE=0` so token differences are reported without aborting the remaining
+tasks. Set `ENFORCE=1` to require exact token matches and `MIN_SPEEDUP` (1.05 by
+default). Run the full Qwen3-8B benchmark with:
+
+```bash
+./run_ascend_benchmark.sh
+```
 
 ## Quick Usage
 
