@@ -195,6 +195,11 @@ If you use Domino in your research, please cite:
   title={Domino: Decoupling Causal Modeling from Autoregressive Drafting in Speculative Decoding},
   author={Huang, Jianuo and Zhang, Yaojie and Zhang, Qituan and Lin, Hao and Xu, Hanlin and Zhang, Linfeng},
   journal={arXiv preprint arXiv:2605.29707},
-  year={2026}
+  year={2026},
+  eprint={2605.29707},
+  archivePrefix={arXiv},
+  primaryClass={cs.CL},
+  doi={10.48550/arXiv.2605.29707},
+  url={https://arxiv.org/abs/2605.29707}
 }
 ```
