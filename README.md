@@ -33,47 +33,61 @@ uv pip install "git+https://github.com/jianuo-huang/sglang.git@feat/domino-tenso
 
 ## Quick Usage
 
-Domino draft checkpoints provide `spec_generate` for direct speculative decoding with a target model. We currently recommend running this path on one GPU.
+### SGLang
+
+```bash
+sglang serve \
+  --model-path Qwen/Qwen3.6-27B \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path Huang2020/Qwen3.6-27B-Domino \
+  --speculative-dflash-block-size 16 \
+  --tp-size 2 \
+  --trust-remote-code
+```
+
+### Transformers
+
+The Transformers backend currently supports Qwen3 checkpoints. Use SGLang
+above for Qwen3.6-27B.
 
 ```python
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-draft_model = AutoModel.from_pretrained(
+draft = AutoModel.from_pretrained(
     "Huang2020/Qwen3-8B-Domino-b16",
     trust_remote_code=True,
-    dtype="auto",
+    torch_dtype="auto",
     device_map="cuda:0",
 ).eval()
 
-target_model = AutoModelForCausalLM.from_pretrained(
+target = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen3-8B",
-    dtype="auto",
+    torch_dtype="auto",
     device_map="cuda:0",
 ).eval()
 
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-prompt = "How many positive whole-number divisors does 196 have?"
-messages = [{"role": "user", "content": prompt}]
-
-# The Domino draft model is trained for Qwen3 with thinking mode disabled.
-text = tokenizer.apply_chat_template(
+messages = [{
+    "role": "user",
+    "content": "How many positive whole-number divisors does 196 have?",
+}]
+input_ids = tokenizer.apply_chat_template(
     messages,
-    tokenize=False,
+    return_tensors="pt",
     add_generation_prompt=True,
     enable_thinking=False,
-)
-model_inputs = tokenizer([text], return_tensors="pt").to(draft_model.device)
+).to(draft.device)
 
-output_ids = draft_model.spec_generate(
-    input_ids=model_inputs["input_ids"],
-    target=target_model,
+output = draft.spec_generate(
+    input_ids=input_ids,
+    target=target,
     max_new_tokens=2048,
     temperature=0.0,
     stop_token_ids=[tokenizer.eos_token_id],
 )
 
-generated_ids = output_ids[:, model_inputs["input_ids"].shape[1]:]
-print(tokenizer.decode(generated_ids[0], skip_special_tokens=True))
+generated = output[:, input_ids.shape[1]:]
+print(tokenizer.decode(generated[0], skip_special_tokens=True))
 ```
 
 ## Hugging Face Benchmark
